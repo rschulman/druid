@@ -41,8 +41,6 @@ use crate::{
 /// FIXME: Replace usage with Color::TRANSPARENT on next Piet release
 const TRANSPARENT: Color = Color::rgba8(0, 0, 0, 0);
 
-pub type ImeUpdateFn = dyn FnOnce(crate::shell::text::Event);
-
 /// A unique identifier for a window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WindowId(u64);
@@ -570,22 +568,6 @@ impl<T: Data> Window<T> {
             .find(|(token, _)| req_token == *token)
             .and_then(|(_, reg)| reg.document.acquire(mutable))
             .unwrap()
-    }
-
-    /// Create a function that can invalidate the provided widget's text state.
-    ///
-    /// This will be called from outside the main app state in order to avoid
-    /// reentrancy problems.
-    pub(crate) fn ime_invalidation_fn(&self, widget: WidgetId) -> Option<Box<ImeUpdateFn>> {
-        let token = self
-            .ime_handlers
-            .iter()
-            .find(|(_, reg)| reg.widget_id == widget)
-            .map(|(t, _)| *t)?;
-        let window_handle = self.handle.clone();
-        Some(Box::new(move |event| {
-            window_handle.update_text_field(token, event)
-        }))
     }
 
     /// Release a lock on an IME session, returning a `WidgetId` if the lock was mutable.

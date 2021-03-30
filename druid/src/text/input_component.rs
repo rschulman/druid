@@ -883,7 +883,7 @@ impl<T: TextStorage + EditableText> InputHandler for EditSessionHandle<T> {
             let x = hit.point.x;
             Some(Rect::new(x, line.y_offset, x, line.y_offset + line.height))
         } else {
-            layout.rects_for_range(range.clone()).first().copied()
+            layout.rects_for_range(range).first().copied()
         }
         .map(|rect| rect + origin.to_vec2())
     }
