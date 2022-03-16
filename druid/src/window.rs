@@ -27,9 +27,9 @@ use crate::shell::{text::InputHandler, Counter, Cursor, Region, TextFieldToken, 
 use crate::app::{PendingWindow, WindowSizePolicy};
 use crate::contexts::ContextState;
 use crate::core::{CommandQueue, FocusChange, WidgetState};
+use crate::debug_state::DebugState;
 use crate::menu::{MenuItemId, MenuManager};
 use crate::text::TextFieldRegistration;
-use crate::util::ExtendDrain;
 use crate::widget::LabelText;
 use crate::win_handler::RUN_COMMANDS_TOKEN;
 use crate::{
@@ -37,9 +37,6 @@ use crate::{
     InternalLifeCycle, LayoutCtx, LifeCycle, LifeCycleCtx, Menu, PaintCtx, Point, Size, TimerToken,
     UpdateCtx, Widget, WidgetId, WidgetPod,
 };
-
-/// FIXME: Replace usage with Color::TRANSPARENT on next Piet release
-const TRANSPARENT: Color = Color::rgba8(0, 0, 0, 0);
 
 pub type ImeUpdateFn = dyn FnOnce(crate::shell::text::Event);
 
@@ -63,6 +60,7 @@ pub struct Window<T> {
     pub(crate) focus: Option<WidgetId>,
     pub(crate) handle: WindowHandle,
     pub(crate) timers: HashMap<TimerToken, WidgetId>,
+    pub(crate) pending_text_registrations: Vec<TextFieldRegistration>,
     pub(crate) transparent: bool,
     pub(crate) ime_handlers: Vec<(TextFieldToken, TextFieldRegistration)>,
     ext_handle: ExtEventSink,
@@ -94,6 +92,7 @@ impl<T> Window<T> {
             ext_handle,
             ime_handlers: Vec::new(),
             ime_focus_change: None,
+            pending_text_registrations: Vec::new(),
         }
     }
 }
@@ -182,15 +181,34 @@ impl<T: Data> Window<T> {
                 false,
             );
         }
-        // Add all the requested timers to the window's timers map.
-        self.timers.extend_drain(&mut widget_state.timers);
+
+        if self.root.state().needs_window_origin && !self.root.state().needs_layout {
+            let event = LifeCycle::Internal(InternalLifeCycle::ParentWindowOrigin);
+            self.lifecycle(queue, &event, data, env, false);
+        }
+
+        // Update the disabled state if necessary
+        // Always do this before updating the focus-chain
+        if self.root.state().tree_disabled_changed() {
+            let event = LifeCycle::Internal(InternalLifeCycle::RouteDisabledChanged);
+            self.lifecycle(queue, &event, data, env, false);
+        }
+
+        // Update the focus-chain if necessary
+        // Always do this before sending focus change, since this event updates the focus chain.
+        if self.root.state().update_focus_chain {
+            let event = LifeCycle::BuildFocusChain;
+            self.lifecycle(queue, &event, data, env, false);
+        }
+
+        self.update_focus(widget_state, queue, data, env);
 
         // If we need a new paint pass, make sure druid-shell knows it.
         if self.wants_animation_frame() {
             self.handle.request_anim_frame();
         }
         self.invalid.union_with(&widget_state.invalid);
-        for ime_field in widget_state.text_registrations.drain(..) {
+        for ime_field in self.pending_text_registrations.drain(..) {
             let token = self.handle.add_text_field();
             tracing::debug!("{:?} added", token);
             self.ime_handlers.push((token, ime_field));
@@ -226,8 +244,8 @@ impl<T: Data> Window<T> {
 
         let event = match event {
             Event::Timer(token) => {
-                if let Some(widget_id) = self.timers.get(&token) {
-                    Event::Internal(InternalEvent::RouteTimer(token, *widget_id))
+                if let Some(widget_id) = self.timers.remove(&token) {
+                    Event::Internal(InternalEvent::RouteTimer(token, widget_id))
                 } else {
                     error!("No widget found for timer {:?}", token);
                     return Handled::No;
@@ -248,8 +266,15 @@ impl<T: Data> Window<T> {
 
         let mut widget_state = WidgetState::new(self.root.id(), Some(self.size));
         let is_handled = {
-            let mut state =
-                ContextState::new::<T>(queue, &self.ext_handle, &self.handle, self.id, self.focus);
+            let mut state = ContextState::new::<T>(
+                queue,
+                &self.ext_handle,
+                &self.handle,
+                self.id,
+                self.focus,
+                &mut self.timers,
+                &mut self.pending_text_registrations,
+            );
             let mut notifications = VecDeque::new();
             let mut ctx = EventCtx {
                 state: &mut state,
@@ -265,59 +290,21 @@ impl<T: Data> Window<T> {
                 self.root.event(&mut ctx, &event, data, env);
             }
 
+            ctx.notifications.retain(|n| n.warn_if_unused_set());
             if !ctx.notifications.is_empty() {
                 info!("{} unhandled notifications:", ctx.notifications.len());
                 for (i, n) in ctx.notifications.iter().enumerate() {
                     info!("{}: {:?}", i, n);
                 }
+                info!(
+                    "if this was intended use EventCtx::submit_notification_unknown_target instead"
+                );
             }
             Handled::from(ctx.is_handled)
         };
 
-        // Clean up the timer token and do it immediately after the event handling
-        // because the token may be reused and re-added in a lifecycle pass below.
-        if let Event::Internal(InternalEvent::RouteTimer(token, _)) = event {
-            self.timers.remove(&token);
-        }
-
-        if let Some(focus_req) = widget_state.request_focus.take() {
-            let old = self.focus;
-            let new = self.widget_for_focus_request(focus_req);
-            // Only send RouteFocusChanged in case there's actual change
-            if old != new {
-                let event = LifeCycle::Internal(InternalLifeCycle::RouteFocusChanged { old, new });
-                self.lifecycle(queue, &event, data, env, false);
-                self.focus = new;
-                // check if the newly focused widget has an IME session, and
-                // notify the system if so.
-                //
-                // If you're here because a profiler sent you: I guess I should've
-                // used a hashmap?
-                let old_was_ime = old
-                    .map(|old| {
-                        self.ime_handlers
-                            .iter()
-                            .any(|(_, sesh)| sesh.widget_id == old)
-                    })
-                    .unwrap_or(false);
-                let maybe_active_text_field = self
-                    .ime_handlers
-                    .iter()
-                    .find(|(_, sesh)| Some(sesh.widget_id) == self.focus)
-                    .map(|(token, _)| *token);
-                // we call this on every focus change; we could call it less but does it matter?
-                self.ime_focus_change = if maybe_active_text_field.is_some() {
-                    Some(maybe_active_text_field)
-                } else if old_was_ime {
-                    Some(None)
-                } else {
-                    None
-                };
-            }
-        }
-
         if let Some(cursor) = &widget_state.cursor {
-            self.handle.set_cursor(&cursor);
+            self.handle.set_cursor(cursor);
         } else if matches!(
             event,
             Event::MouseMove(..) | Event::Internal(InternalEvent::MouseLeave)
@@ -348,8 +335,15 @@ impl<T: Data> Window<T> {
         process_commands: bool,
     ) {
         let mut widget_state = WidgetState::new(self.root.id(), Some(self.size));
-        let mut state =
-            ContextState::new::<T>(queue, &self.ext_handle, &self.handle, self.id, self.focus);
+        let mut state = ContextState::new::<T>(
+            queue,
+            &self.ext_handle,
+            &self.handle,
+            self.id,
+            self.focus,
+            &mut self.timers,
+            &mut self.pending_text_registrations,
+        );
         let mut ctx = LifeCycleCtx {
             state: &mut state,
             widget_state: &mut widget_state,
@@ -368,8 +362,15 @@ impl<T: Data> Window<T> {
         self.update_title(data, env);
 
         let mut widget_state = WidgetState::new(self.root.id(), Some(self.size));
-        let mut state =
-            ContextState::new::<T>(queue, &self.ext_handle, &self.handle, self.id, self.focus);
+        let mut state = ContextState::new::<T>(
+            queue,
+            &self.ext_handle,
+            &self.handle,
+            self.id,
+            self.focus,
+            &mut self.timers,
+            &mut self.pending_text_registrations,
+        );
         let mut update_ctx = UpdateCtx {
             widget_state: &mut widget_state,
             state: &mut state,
@@ -401,13 +402,11 @@ impl<T: Data> Window<T> {
         self.invalid.clear();
     }
 
-    #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn invalid(&self) -> &Region {
         &self.invalid
     }
 
-    #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn invalid_mut(&mut self) -> &mut Region {
         &mut self.invalid
@@ -441,21 +440,30 @@ impl<T: Data> Window<T> {
             self.layout(queue, data, env);
         }
 
-        piet.fill(
-            invalid.bounding_box(),
-            &(if self.transparent {
-                TRANSPARENT
-            } else {
-                env.get(crate::theme::WINDOW_BACKGROUND_COLOR)
-            }),
-        );
+        for &r in invalid.rects() {
+            piet.clear(
+                Some(r),
+                if self.transparent {
+                    Color::TRANSPARENT
+                } else {
+                    env.get(crate::theme::WINDOW_BACKGROUND_COLOR)
+                },
+            );
+        }
         self.paint(piet, invalid, queue, data, env);
     }
 
     fn layout(&mut self, queue: &mut CommandQueue, data: &T, env: &Env) {
         let mut widget_state = WidgetState::new(self.root.id(), Some(self.size));
-        let mut state =
-            ContextState::new::<T>(queue, &self.ext_handle, &self.handle, self.id, self.focus);
+        let mut state = ContextState::new::<T>(
+            queue,
+            &self.ext_handle,
+            &self.handle,
+            self.id,
+            self.focus,
+            &mut self.timers,
+            &mut self.pending_text_registrations,
+        );
         let mut layout_ctx = LayoutCtx {
             state: &mut state,
             widget_state: &mut widget_state,
@@ -494,7 +502,6 @@ impl<T: Data> Window<T> {
 
     /// only expose `layout` for testing; normally it is called as part of `do_paint`
     #[cfg(not(target_arch = "wasm32"))]
-    #[cfg(test)]
     pub(crate) fn just_layout(&mut self, queue: &mut CommandQueue, data: &T, env: &Env) {
         self.layout(queue, data, env)
     }
@@ -508,8 +515,15 @@ impl<T: Data> Window<T> {
         env: &Env,
     ) {
         let widget_state = WidgetState::new(self.root.id(), Some(self.size));
-        let mut state =
-            ContextState::new::<T>(queue, &self.ext_handle, &self.handle, self.id, self.focus);
+        let mut state = ContextState::new::<T>(
+            queue,
+            &self.ext_handle,
+            &self.handle,
+            self.id,
+            self.focus,
+            &mut self.timers,
+            &mut self.pending_text_registrations,
+        );
         let mut ctx = PaintCtx {
             render_ctx: piet,
             state: &mut state,
@@ -541,6 +555,11 @@ impl<T: Data> Window<T> {
         }
     }
 
+    /// Get a best-effort representation of the entire widget tree for debug purposes.
+    pub fn root_debug_state(&self, data: &T) -> DebugState {
+        self.root.widget().debug_state(data)
+    }
+
     pub(crate) fn update_title(&mut self, data: &T, env: &Env) {
         if self.title.resolve(data, env) {
             self.handle.set_title(&self.title.display_text());
@@ -570,6 +589,50 @@ impl<T: Data> Window<T> {
             .find(|(token, _)| req_token == *token)
             .and_then(|(_, reg)| reg.document.acquire(mutable))
             .unwrap()
+    }
+
+    fn update_focus(
+        &mut self,
+        widget_state: &mut WidgetState,
+        queue: &mut CommandQueue,
+        data: &T,
+        env: &Env,
+    ) {
+        if let Some(focus_req) = widget_state.request_focus.take() {
+            let old = self.focus;
+            let new = self.widget_for_focus_request(focus_req);
+            // Only send RouteFocusChanged in case there's actual change
+            if old != new {
+                let event = LifeCycle::Internal(InternalLifeCycle::RouteFocusChanged { old, new });
+                self.lifecycle(queue, &event, data, env, false);
+                self.focus = new;
+                // check if the newly focused widget has an IME session, and
+                // notify the system if so.
+                //
+                // If you're here because a profiler sent you: I guess I should've
+                // used a hashmap?
+                let old_was_ime = old
+                    .map(|old| {
+                        self.ime_handlers
+                            .iter()
+                            .any(|(_, sesh)| sesh.widget_id == old)
+                    })
+                    .unwrap_or(false);
+                let maybe_active_text_field = self
+                    .ime_handlers
+                    .iter()
+                    .find(|(_, sesh)| Some(sesh.widget_id) == self.focus)
+                    .map(|(token, _)| *token);
+                // we call this on every focus change; we could call it less but does it matter?
+                self.ime_focus_change = if maybe_active_text_field.is_some() {
+                    Some(maybe_active_text_field)
+                } else if old_was_ime {
+                    Some(None)
+                } else {
+                    None
+                };
+            }
+        }
     }
 
     /// Create a function that can invalidate the provided widget's text state.

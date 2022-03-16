@@ -14,6 +14,8 @@
 
 //! A container that scrolls its contents.
 
+use crate::commands::SCROLL_TO_VIEW;
+use crate::debug_state::DebugState;
 use crate::widget::prelude::*;
 use crate::widget::{Axis, ClipBox};
 use crate::{scroll_component::*, Data, Rect, Vec2};
@@ -44,7 +46,7 @@ impl<T, W: Widget<T>> Scroll<T, W> {
     /// [horizontal](#method.horizontal) methods to limit scrolling to a specific axis.
     pub fn new(child: W) -> Scroll<T, W> {
         Scroll {
-            clip: ClipBox::new(child),
+            clip: ClipBox::managed(child),
             scroll_component: ScrollComponent::new(),
         }
     }
@@ -126,11 +128,17 @@ impl<T, W> Scroll<T, W> {
     /// Set whether the content can be scrolled in the vertical direction.
     pub fn set_vertical_scroll_enabled(&mut self, enabled: bool) {
         self.clip.set_constrain_vertical(!enabled);
+        self.scroll_component
+            .enabled
+            .set_vertical_scrollbar_enabled(enabled);
     }
 
     /// Set whether the content can be scrolled in the horizontal direction.
     pub fn set_horizontal_scroll_enabled(&mut self, enabled: bool) {
         self.clip.set_constrain_horizontal(!enabled);
+        self.scroll_component
+            .enabled
+            .set_horizontal_scrollbar_enabled(enabled);
     }
 
     /// Returns a reference to the child widget.
@@ -157,7 +165,7 @@ impl<T, W> Scroll<T, W> {
     ///
     /// This is relative to the bounds of the content.
     pub fn viewport_rect(&self) -> Rect {
-        self.clip.viewport().rect
+        self.clip.viewport().view_rect()
     }
 
     /// Return the scroll offset on a particular axis
@@ -177,8 +185,25 @@ impl<T: Data, W: Widget<T>> Widget<T> for Scroll<T, W> {
             self.clip.event(ctx, event, data, env);
         }
 
+        // Handle scroll after the inner widget processed the events, to prefer inner widgets while
+        // scrolling.
         self.clip.with_port(|port| {
             scroll_component.handle_scroll(port, ctx, event, env);
+
+            if !scroll_component.are_bars_held() {
+                // We only scroll to the component if the user is not trying to move the scrollbar.
+                if let Event::Notification(notification) = event {
+                    if let Some(&global_highlight_rect) = notification.get(SCROLL_TO_VIEW) {
+                        ctx.set_handled();
+                        let view_port_changed =
+                            port.default_scroll_to_view_handling(ctx, global_highlight_rect);
+                        if view_port_changed {
+                            scroll_component
+                                .reset_scrollbar_fade(|duration| ctx.request_timer(duration), env);
+                        }
+                    }
+                }
+            }
         });
     }
 
@@ -197,8 +222,8 @@ impl<T: Data, W: Widget<T>> Widget<T> for Scroll<T, W> {
     fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints, data: &T, env: &Env) -> Size {
         bc.debug_check("Scroll");
 
-        let old_size = self.clip.viewport().rect.size();
-        let child_size = self.clip.layout(ctx, &bc, data, env);
+        let old_size = self.clip.viewport().view_size;
+        let child_size = self.clip.layout(ctx, bc, data, env);
         log_size_warnings(child_size);
 
         let self_size = bc.constrain(child_size);
@@ -219,6 +244,14 @@ impl<T: Data, W: Widget<T>> Widget<T> for Scroll<T, W> {
         self.clip.paint(ctx, data, env);
         self.scroll_component
             .draw_bars(ctx, &self.clip.viewport(), env);
+    }
+
+    fn debug_state(&self, data: &T) -> DebugState {
+        DebugState {
+            display_name: self.short_type_name().to_string(),
+            children: vec![self.clip.debug_state(data)],
+            ..Default::default()
+        }
     }
 }
 

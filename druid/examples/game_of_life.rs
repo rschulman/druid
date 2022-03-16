@@ -15,6 +15,9 @@
 //! This is an example of how you would implement the game of life with druid.
 //! This example doesnt showcase anything specific in druid.
 
+// On Windows platform, don't show a console when opening the app.
+#![windows_subsystem = "windows"]
+
 use std::ops::{Index, IndexMut};
 use std::time::{Duration, Instant};
 
@@ -37,7 +40,7 @@ static COLOURS: ColorScheme = &[
     Color::rgb8(0xE0, 0xAF, 0xAF), //Color::rgb(224,175,175)
 ];
 
-#[allow(clippy::clippy::rc_buffer)]
+#[allow(clippy::rc_buffer)]
 #[derive(Clone, Data, PartialEq)]
 struct Grid {
     storage: Arc<Vec<bool>>,
@@ -370,8 +373,8 @@ fn make_widget() -> impl Widget<AppData> {
                         .with_flex_child(
                             // pause / resume button
                             Button::new(|data: &bool, _: &Env| match data {
-                                true => "Resume".into(),
-                                false => "Pause".into(),
+                                true => "Resume",
+                                false => "Pause",
                             })
                             .on_click(|ctx, data: &mut bool, _: &Env| {
                                 *data = !*data;

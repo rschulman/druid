@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Interacting with the system pasteboard/clipboard.
-pub use crate::platform::clipboard as platform;
+pub use crate::backend::clipboard as backend;
 
 /// A handle to the system clipboard.
 ///
@@ -25,7 +25,7 @@ pub use crate::platform::clipboard as platform;
 /// Copying and pasting text is simple, using [`Clipboard::put_string`] and
 /// [`Clipboard::get_string`]. If this is all you need, you're in luck.
 ///
-/// # Advanced useage
+/// # Advanced usage
 ///
 /// When working with data more complicated than plaintext, you will generally
 /// want to make that data available in multiple formats.
@@ -126,7 +126,7 @@ pub use crate::platform::clipboard as platform;
 /// [MIME types]: https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/MIME_types
 /// [`ClipboardFormat`]: struct.ClipboardFormat.html
 #[derive(Debug, Clone)]
-pub struct Clipboard(platform::Clipboard);
+pub struct Clipboard(pub(crate) backend::Clipboard);
 
 impl Clipboard {
     /// Put a string onto the system clipboard.
@@ -179,6 +179,8 @@ pub type FormatId = &'static str;
 
 /// Data coupled with a type identifier.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "wayland", allow(dead_code))]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub struct ClipboardFormat {
     pub(crate) identifier: FormatId,
     pub(crate) data: Vec<u8>,
@@ -208,8 +210,8 @@ impl From<&str> for ClipboardFormat {
     }
 }
 
-impl From<platform::Clipboard> for Clipboard {
-    fn from(src: platform::Clipboard) -> Clipboard {
+impl From<backend::Clipboard> for Clipboard {
+    fn from(src: backend::Clipboard) -> Clipboard {
         Clipboard(src)
     }
 }
@@ -224,7 +226,7 @@ cfg_if::cfg_if! {
     } else {
         impl ClipboardFormat {
             cfg_if::cfg_if! {
-                if #[cfg(target_os = "linux")] {
+                if #[cfg(any(target_os = "linux", target_os = "openbsd"))] {
                     // trial and error; this is the most supported string type for gtk?
                     pub const TEXT: &'static str = "UTF8_STRING";
                 } else {

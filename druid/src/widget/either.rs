@@ -14,6 +14,7 @@
 
 //! A widget that switches dynamically between two child views.
 
+use crate::debug_state::DebugState;
 use crate::widget::prelude::*;
 use crate::{Data, Point, WidgetPod};
 use tracing::instrument;
@@ -75,7 +76,7 @@ impl<T: Data> Widget<T> for Either<T> {
         let current = (self.closure)(data, env);
         if current != self.current {
             self.current = current;
-            ctx.request_layout();
+            ctx.children_changed();
         }
         self.current_widget().update(ctx, data, env)
     }
@@ -92,6 +93,19 @@ impl<T: Data> Widget<T> for Either<T> {
     #[instrument(name = "Either", level = "trace", skip(self, ctx, data, env), fields(branch = self.current))]
     fn paint(&mut self, ctx: &mut PaintCtx, data: &T, env: &Env) {
         self.current_widget().paint(ctx, data, env)
+    }
+
+    fn debug_state(&self, data: &T) -> DebugState {
+        let current_widget = if self.current {
+            &self.true_branch
+        } else {
+            &self.false_branch
+        };
+        DebugState {
+            display_name: self.short_type_name().to_string(),
+            children: vec![current_widget.widget().debug_state(data)],
+            ..Default::default()
+        }
     }
 }
 

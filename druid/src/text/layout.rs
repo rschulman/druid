@@ -17,7 +17,7 @@
 use std::ops::Range;
 use std::rc::Rc;
 
-use super::{Link, TextStorage};
+use super::{EnvUpdateCtx, Link, TextStorage};
 use crate::kurbo::{Line, Point, Rect, Size};
 use crate::piet::{
     Color, PietText, PietTextLayout, Text as _, TextAlignment, TextAttribute, TextLayout as _,
@@ -82,7 +82,7 @@ impl<T> TextLayout<T> {
         TextLayout {
             text: None,
             font: crate::theme::UI_FONT.into(),
-            text_color: crate::theme::LABEL_COLOR.into(),
+            text_color: crate::theme::TEXT_COLOR.into(),
             text_size_override: None,
             layout: None,
             wrap_width: f64::INFINITY,
@@ -347,6 +347,11 @@ impl<T: TextStorage> TextLayout<T> {
                     .text_size_override
                     .as_ref()
                     .map(|k| ctx.env_key_changed(k))
+                    .unwrap_or(false)
+                || self
+                    .text
+                    .as_ref()
+                    .map(|text| text.env_update(&EnvUpdateCtx::for_update(ctx)))
                     .unwrap_or(false);
 
             if rebuild {

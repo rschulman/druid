@@ -22,6 +22,7 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use tracing::{instrument, trace};
 
+use crate::commands::SCROLL_TO_VIEW;
 use crate::kurbo::{Circle, Line};
 use crate::widget::prelude::*;
 use crate::widget::{Axis, Flex, Label, LabelText, LensScopeTransfer, Painter, Scope, ScopePolicy};
@@ -374,7 +375,6 @@ impl<TP: TabsPolicy> Widget<TabsState<TP>> for TabBar<TP> {
         if let LifeCycle::WidgetAdded = event {
             self.ensure_tabs(data);
             ctx.children_changed();
-            ctx.request_layout();
         }
 
         for (_, tab) in self.tabs.iter_mut() {
@@ -397,7 +397,6 @@ impl<TP: TabsPolicy> Widget<TabsState<TP>> for TabBar<TP> {
         if data.policy.tabs_changed(&old_data.inner, &data.inner) {
             self.ensure_tabs(data);
             ctx.children_changed();
-            ctx.request_layout();
         } else if old_data.selected != data.selected {
             ctx.request_paint();
         }
@@ -524,7 +523,7 @@ fn ensure_for_tabs<Content, TP: TabsPolicy + ?Sized>(
             existing_idx.push(contents.len());
             child
         } else {
-            f(&policy, key.clone())
+            f(policy, key.clone())
         };
         contents.push((key.clone(), next))
     }
@@ -581,7 +580,14 @@ impl<TP: TabsPolicy> TabsBody<TP> {
 impl<TP: TabsPolicy> Widget<TabsState<TP>> for TabsBody<TP> {
     #[instrument(name = "TabsBody", level = "trace", skip(self, ctx, event, data, env))]
     fn event(&mut self, ctx: &mut EventCtx, event: &Event, data: &mut TabsState<TP>, env: &Env) {
-        if event.should_propagate_to_hidden() {
+        if let Event::Notification(notification) = event {
+            if notification.is(SCROLL_TO_VIEW)
+                && Some(notification.route()) != self.active_child(data).map(|w| w.id())
+            {
+                // Ignore SCROLL_TO_VIEW requests from every widget except the active.
+                ctx.set_handled();
+            }
+        } else if event.should_propagate_to_hidden() {
             for child in self.child_pods() {
                 child.event(ctx, event, &mut data.inner, env);
             }
@@ -590,7 +596,14 @@ impl<TP: TabsPolicy> Widget<TabsState<TP>> for TabsBody<TP> {
         }
 
         if let (Some(t_state), Event::AnimFrame(interval)) = (&mut self.transition_state, event) {
-            t_state.current_time += *interval;
+            // We can get a high interval on the first frame due to other widgets or old animations.
+            let interval = if t_state.current_time == 0 {
+                1
+            } else {
+                *interval
+            };
+
+            t_state.current_time += interval;
             if t_state.live() {
                 ctx.request_anim_frame();
             } else {
@@ -611,7 +624,6 @@ impl<TP: TabsPolicy> Widget<TabsState<TP>> for TabsBody<TP> {
         if let LifeCycle::WidgetAdded = event {
             self.make_tabs(data);
             ctx.children_changed();
-            ctx.request_layout();
         }
 
         if event.should_propagate_to_hidden() {
@@ -638,7 +650,6 @@ impl<TP: TabsPolicy> Widget<TabsState<TP>> for TabsBody<TP> {
     ) {
         let init = if data.policy.tabs_changed(&old_data.inner, &data.inner) {
             ctx.children_changed();
-            ctx.request_layout();
             Some(self.make_tabs(data))
         } else {
             None
@@ -648,7 +659,7 @@ impl<TP: TabsPolicy> Widget<TabsState<TP>> for TabsBody<TP> {
             self.transition_state = self
                 .transition
                 .tab_changed(old_data.selected, data.selected);
-            ctx.request_layout();
+            ctx.children_changed();
 
             if self.transition_state.is_some() {
                 ctx.request_anim_frame();
@@ -798,9 +809,11 @@ impl<T: Data> InitialTab<T> {
 enum TabsContent<TP: TabsPolicy> {
     Building {
         tabs: TP::Build,
+        index: TabIndex,
     },
     Complete {
         tabs: TP,
+        index: TabIndex,
     },
     Running {
         scope: WidgetPod<TP::Input, TabsScope<TP>>,
@@ -866,7 +879,7 @@ impl<TP: TabsPolicy> Tabs<TP> {
     /// Create a Tabs widget using the provided policy.
     /// This is useful for tabs derived from data.
     pub fn for_policy(tabs: TP) -> Self {
-        Self::of_content(TabsContent::Complete { tabs })
+        Self::of_content(TabsContent::Complete { tabs, index: 0 })
     }
 
     // This could be public if there is a case for custom policies that support static tabs - ie the AddTab method.
@@ -878,6 +891,7 @@ impl<TP: TabsPolicy> Tabs<TP> {
     {
         Self::of_content(TabsContent::Building {
             tabs: tabs_from_data,
+            index: 0,
         })
     }
 
@@ -913,6 +927,12 @@ impl<TP: TabsPolicy> Tabs<TP> {
         self
     }
 
+    /// A builder-style method to specify the (zero-based) index of the selected tab.
+    pub fn with_tab_index(mut self, idx: TabIndex) -> Self {
+        self.set_tab_index(idx);
+        self
+    }
+
     /// Available when the policy implements AddTab - e.g StaticTabs.
     /// Return this Tabs widget with the named tab added.
     pub fn add_tab(
@@ -922,35 +942,60 @@ impl<TP: TabsPolicy> Tabs<TP> {
     ) where
         TP: AddTab,
     {
-        if let TabsContent::Building { tabs } = &mut self.content {
+        if let TabsContent::Building { tabs, .. } = &mut self.content {
             TP::add_tab(tabs, name, child)
         } else {
             tracing::warn!("Can't add static tabs to a running or complete tabs instance!")
         }
     }
 
-    fn make_scope(&self, tabs_from_data: TP) -> WidgetPod<TP::Input, TabsScope<TP>> {
-        let (tabs_bar, tabs_body) = (
-            (TabBar::new(self.axis, self.edge), 0.0),
-            (
-                TabsBody::new(self.axis, self.transition)
-                    .padding(5.)
-                    .border(theme::BORDER_DARK, 0.5),
-                1.0,
-            ),
-        );
+    /// The (zero-based) index of the currently selected tab.
+    pub fn tab_index(&self) -> TabIndex {
+        let index = match &self.content {
+            TabsContent::Running { scope, .. } => scope.widget().state().map(|s| s.selected),
+            TabsContent::Building { index, .. } | TabsContent::Complete { index, .. } => {
+                Some(*index)
+            }
+            TabsContent::Swapping => None,
+        };
+        index.unwrap_or(0)
+    }
+
+    /// Set the selected (zero-based) tab index.
+    ///
+    /// This tab will become visible if it exists. If animations are enabled
+    /// (and the widget is laid out), the tab transition will be animated.
+    pub fn set_tab_index(&mut self, idx: TabIndex) {
+        match &mut self.content {
+            TabsContent::Running { scope, .. } => {
+                if let Some(state) = scope.widget_mut().state_mut() {
+                    state.selected = idx
+                }
+            }
+            TabsContent::Building { index, .. } | TabsContent::Complete { index, .. } => {
+                *index = idx;
+            }
+            TabsContent::Swapping => (),
+        }
+    }
+
+    fn make_scope(&self, tabs_from_data: TP, idx: TabIndex) -> WidgetPod<TP::Input, TabsScope<TP>> {
+        let tabs_bar = TabBar::new(self.axis, self.edge);
+        let tabs_body = TabsBody::new(self.axis, self.transition)
+            .padding(5.)
+            .border(theme::BORDER_DARK, 0.5);
         let mut layout: Flex<TabsState<TP>> = Flex::for_axis(self.axis.cross());
 
         if let TabsEdge::Trailing = self.edge {
-            layout.add_flex_child(tabs_body.0, tabs_body.1);
-            layout.add_flex_child(tabs_bar.0, tabs_bar.1);
+            layout.add_flex_child(tabs_body, 1.);
+            layout.add_child(tabs_bar);
         } else {
-            layout.add_flex_child(tabs_bar.0, tabs_bar.1);
-            layout.add_flex_child(tabs_body.0, tabs_body.1);
+            layout.add_child(tabs_bar);
+            layout.add_flex_child(tabs_body, 1.);
         };
 
         WidgetPod::new(Scope::new(
-            TabsScopePolicy::new(tabs_from_data, 0),
+            TabsScopePolicy::new(tabs_from_data, idx),
             Box::new(layout),
         ))
     }
@@ -976,16 +1021,16 @@ impl<TP: TabsPolicy> Widget<TP::Input> for Tabs<TP> {
             let content = std::mem::replace(&mut self.content, TabsContent::Swapping);
 
             self.content = match content {
-                TabsContent::Building { tabs } => {
+                TabsContent::Building { tabs, index } => {
                     ctx.children_changed();
                     TabsContent::Running {
-                        scope: self.make_scope(TP::build(tabs)),
+                        scope: self.make_scope(TP::build(tabs), index),
                     }
                 }
-                TabsContent::Complete { tabs } => {
+                TabsContent::Complete { tabs, index } => {
                     ctx.children_changed();
                     TabsContent::Running {
-                        scope: self.make_scope(tabs),
+                        scope: self.make_scope(tabs, index),
                     }
                 }
                 _ => content,

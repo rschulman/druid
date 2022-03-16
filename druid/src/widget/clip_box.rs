@@ -12,22 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::commands::SCROLL_TO_VIEW;
+use crate::debug_state::DebugState;
 use crate::kurbo::{Affine, Point, Rect, Size, Vec2};
 use crate::widget::prelude::*;
 use crate::widget::Axis;
 use crate::{Data, WidgetPod};
-use tracing::{instrument, trace};
+use tracing::{info, instrument, trace, warn};
 
 /// Represents the size and position of a rectangular "viewport" into a larger area.
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct Viewport {
     /// The size of the area that we have a viewport into.
     pub content_size: Size,
-    /// The view rectangle.
-    pub rect: Rect,
+    /// The origin of the view rectangle, relative to the content.
+    pub view_origin: Point,
+    /// The size of the view rectangle.
+    pub view_size: Size,
 }
 
 impl Viewport {
+    /// The view rectangle.
+    pub fn view_rect(&self) -> Rect {
+        Rect::from_origin_size(self.view_origin, self.view_size)
+    }
+
     /// Tries to find a position for the view rectangle that is contained in the content rectangle.
     ///
     /// If the supplied origin is good, returns it; if it isn't, we try to return the nearest
@@ -37,11 +46,11 @@ impl Viewport {
     pub fn clamp_view_origin(&self, origin: Point) -> Point {
         let x = origin
             .x
-            .min(self.content_size.width - self.rect.width())
+            .min(self.content_size.width - self.view_size.width)
             .max(0.0);
         let y = origin
             .y
-            .min(self.content_size.height - self.rect.height())
+            .min(self.content_size.height - self.view_size.height)
             .max(0.0);
         Point::new(x, y)
     }
@@ -54,7 +63,7 @@ impl Viewport {
     /// bottom of the child widget, then the offset will not change and this function will return
     /// false.
     pub fn pan_by(&mut self, delta: Vec2) -> bool {
-        self.pan_to(self.rect.origin() + delta)
+        self.pan_to(self.view_origin + delta)
     }
 
     /// Sets the viewport origin to `pos`, while trying to keep the view rectangle inside the
@@ -65,8 +74,8 @@ impl Viewport {
     /// `pos`.
     pub fn pan_to(&mut self, origin: Point) -> bool {
         let new_origin = self.clamp_view_origin(origin);
-        if (new_origin - self.rect.origin()).hypot2() > 1e-12 {
-            self.rect = self.rect.with_origin(new_origin);
+        if (new_origin - self.view_origin).hypot2() > 1e-12 {
+            self.view_origin = new_origin;
             true
         } else {
             false
@@ -98,20 +107,83 @@ impl Viewport {
         // this means we will show the portion of the target region that
         // includes the origin.
         let target_size = Size::new(
-            rect.width().min(self.rect.width()),
-            rect.height().min(self.rect.height()),
+            rect.width().min(self.view_size.width),
+            rect.height().min(self.view_size.height),
         );
         let rect = rect.with_size(target_size);
 
-        let x0 = closest_on_axis(rect.min_x(), self.rect.min_x(), self.rect.max_x());
-        let x1 = closest_on_axis(rect.max_x(), self.rect.min_x(), self.rect.max_x());
-        let y0 = closest_on_axis(rect.min_y(), self.rect.min_y(), self.rect.max_y());
-        let y1 = closest_on_axis(rect.max_y(), self.rect.min_y(), self.rect.max_y());
+        let my_rect = self.view_rect();
+        let x0 = closest_on_axis(rect.min_x(), my_rect.min_x(), my_rect.max_x());
+        let x1 = closest_on_axis(rect.max_x(), my_rect.min_x(), my_rect.max_x());
+        let y0 = closest_on_axis(rect.min_y(), my_rect.min_y(), my_rect.max_y());
+        let y1 = closest_on_axis(rect.max_y(), my_rect.min_y(), my_rect.max_y());
 
         let delta_x = if x0.abs() > x1.abs() { x0 } else { x1 };
         let delta_y = if y0.abs() > y1.abs() { y0 } else { y1 };
-        let new_origin = self.rect.origin() + Vec2::new(delta_x, delta_y);
+        let new_origin = self.view_origin + Vec2::new(delta_x, delta_y);
         self.pan_to(new_origin)
+    }
+
+    /// The default handling of the [`SCROLL_TO_VIEW`] notification for a scrolling container.
+    ///
+    /// The [`SCROLL_TO_VIEW`] notification is send when [`scroll_to_view`] or [`scroll_area_to_view`]
+    /// are called.
+    ///
+    /// [`SCROLL_TO_VIEW`]: crate::commands::SCROLL_TO_VIEW
+    /// [`scroll_to_view`]: crate::EventCtx::scroll_to_view()
+    /// [`scroll_area_to_view`]: crate::EventCtx::scroll_area_to_view()
+    pub fn default_scroll_to_view_handling(
+        &mut self,
+        ctx: &mut EventCtx,
+        global_highlight_rect: Rect,
+    ) -> bool {
+        let mut viewport_changed = false;
+        let global_content_offset = ctx.window_origin().to_vec2() - self.view_origin.to_vec2();
+        let content_highlight_rect = global_highlight_rect - global_content_offset;
+
+        if self
+            .content_size
+            .to_rect()
+            .intersect(content_highlight_rect)
+            != content_highlight_rect
+        {
+            warn!("tried to bring area outside of the content to view!");
+        }
+
+        if self.pan_to_visible(content_highlight_rect) {
+            ctx.request_paint();
+            viewport_changed = true;
+        }
+        // This is a new value since view_origin has changed in the meantime
+        let global_content_offset = ctx.window_origin().to_vec2() - self.view_origin.to_vec2();
+        ctx.submit_notification_without_warning(
+            SCROLL_TO_VIEW.with(content_highlight_rect + global_content_offset),
+        );
+        viewport_changed
+    }
+
+    /// This method handles SCROLL_TO_VIEW by clipping the view_rect to the content rect.
+    ///
+    /// The [`SCROLL_TO_VIEW`] notification is send when [`scroll_to_view`] or [`scroll_area_to_view`]
+    /// are called.
+    ///
+    /// [`SCROLL_TO_VIEW`]: crate::commands::SCROLL_TO_VIEW
+    /// [`scroll_to_view`]: crate::EventCtx::scroll_to_view()
+    /// [`scroll_area_to_view`]: crate::EventCtx::scroll_area_to_view()
+    pub fn fixed_scroll_to_view_handling(
+        &self,
+        ctx: &mut EventCtx,
+        global_highlight_rect: Rect,
+        source: WidgetId,
+    ) {
+        let global_viewport_rect = self.view_rect() + ctx.window_origin().to_vec2();
+        let clipped_highlight_rect = global_highlight_rect.intersect(global_viewport_rect);
+
+        if clipped_highlight_rect.area() > 0.0 {
+            ctx.submit_notification_without_warning(SCROLL_TO_VIEW.with(clipped_highlight_rect));
+        } else {
+            info!("Hidden Widget({}) in unmanaged clip requested SCROLL_TO_VIEW. The request is ignored.", source.to_raw());
+        }
     }
 }
 
@@ -123,6 +195,10 @@ pub struct ClipBox<T, W> {
     constrain_horizontal: bool,
     constrain_vertical: bool,
     must_fill: bool,
+    old_bc: BoxConstraints,
+
+    //This ClipBox is wrapped by a widget which manages the viewport_offset
+    managed: bool,
 }
 
 impl<T, W> ClipBox<T, W> {
@@ -180,7 +256,7 @@ impl<T, W> ClipBox<T, W> {
 
     /// Returns the origin of the viewport rectangle.
     pub fn viewport_origin(&self) -> Point {
-        self.port.rect.origin()
+        self.port.view_origin
     }
 
     /// Returns the size of the rectangular viewport into the child widget.
@@ -188,7 +264,7 @@ impl<T, W> ClipBox<T, W> {
     ///
     /// [`viewport_origin`]: struct.ClipBox.html#method.viewport_origin
     pub fn viewport_size(&self) -> Size {
-        self.port.rect.size()
+        self.port.view_size
     }
 
     /// Returns the size of the child widget.
@@ -227,13 +303,39 @@ impl<T, W> ClipBox<T, W> {
 
 impl<T, W: Widget<T>> ClipBox<T, W> {
     /// Creates a new `ClipBox` wrapping `child`.
-    pub fn new(child: W) -> Self {
+    ///
+    /// This method should only be used when creating your own widget, which uses ClipBox
+    /// internally.
+    ///
+    /// `ClipBox` will forward [`SCROLL_TO_VIEW`] notifications to its parent unchanged.
+    /// In this case the parent has to handle said notification itself. By default the ClipBox will
+    /// filter out [`SCROLL_TO_VIEW`] notifications which refer to areas not visible.
+    ///
+    /// [`SCROLL_TO_VIEW`]: crate::commands::SCROLL_TO_VIEW
+    pub fn managed(child: W) -> Self {
         ClipBox {
             child: WidgetPod::new(child),
             port: Default::default(),
             constrain_horizontal: false,
             constrain_vertical: false,
             must_fill: false,
+            old_bc: BoxConstraints::tight(Size::ZERO),
+            managed: true,
+        }
+    }
+
+    /// Creates a new unmanaged `ClipBox` wrapping `child`.
+    ///
+    /// This method should be used when you are using ClipBox in the widget-hierachie directly.
+    pub fn unmanaged(child: W) -> Self {
+        ClipBox {
+            child: WidgetPod::new(child),
+            port: Default::default(),
+            constrain_horizontal: false,
+            constrain_vertical: false,
+            must_fill: false,
+            old_bc: BoxConstraints::tight(Size::ZERO),
+            managed: false,
         }
     }
 
@@ -304,12 +406,30 @@ impl<T, W: Widget<T>> ClipBox<T, W> {
 impl<T: Data, W: Widget<T>> Widget<T> for ClipBox<T, W> {
     #[instrument(name = "ClipBox", level = "trace", skip(self, ctx, event, data, env))]
     fn event(&mut self, ctx: &mut EventCtx, event: &Event, data: &mut T, env: &Env) {
-        let viewport = ctx.size().to_rect();
-        let force_event = self.child.is_hot() || self.child.has_active();
-        if let Some(child_event) =
-            event.transform_scroll(self.viewport_origin().to_vec2(), viewport, force_event)
-        {
-            self.child.event(ctx, &child_event, data, env);
+        if let Event::Notification(notification) = event {
+            if let Some(global_highlight_rect) = notification.get(SCROLL_TO_VIEW) {
+                if !self.managed {
+                    // If the parent widget does not handle SCROLL_TO_VIEW notifications, we
+                    // prevent unexpected behaviour, by clipping SCROLL_TO_VIEW notifications
+                    // to this ClipBox's viewport.
+                    ctx.set_handled();
+                    self.with_port(|port| {
+                        port.fixed_scroll_to_view_handling(
+                            ctx,
+                            *global_highlight_rect,
+                            notification.source(),
+                        );
+                    });
+                }
+            }
+        } else {
+            let viewport = ctx.size().to_rect();
+            let force_event = self.child.is_hot() || self.child.has_active();
+            if let Some(child_event) =
+                event.transform_scroll(self.viewport_origin().to_vec2(), viewport, force_event)
+            {
+                self.child.event(ctx, &child_event, data, env);
+            }
         }
     }
 
@@ -345,11 +465,19 @@ impl<T: Data, W: Widget<T>> Widget<T> for ClipBox<T, W> {
         let child_bc =
             BoxConstraints::new(min_child_size, Size::new(max_child_width, max_child_height));
 
-        let content_size = self.child.layout(ctx, &child_bc, data, env);
+        let bc_changed = child_bc != self.old_bc;
+        self.old_bc = child_bc;
+
+        let content_size = if bc_changed || self.child.layout_requested() {
+            self.child.layout(ctx, &child_bc, data, env)
+        } else {
+            self.child.layout_rect().size()
+        };
+
         self.port.content_size = content_size;
         self.child.set_origin(ctx, data, env, Point::ORIGIN);
 
-        self.port.rect = self.port.rect.with_size(bc.constrain(content_size));
+        self.port.view_size = bc.constrain(content_size);
         let new_offset = self.port.clamp_view_origin(self.viewport_origin());
         self.pan_to(new_offset);
         trace!("Computed sized: {}", self.viewport_size());
@@ -369,30 +497,39 @@ impl<T: Data, W: Widget<T>> Widget<T> for ClipBox<T, W> {
             ctx.with_child_ctx(visible, |ctx| self.child.paint_raw(ctx, data, env));
         });
     }
+
+    fn debug_state(&self, data: &T) -> DebugState {
+        DebugState {
+            display_name: self.short_type_name().to_string(),
+            children: vec![self.child.widget().debug_state(data)],
+            ..Default::default()
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use test_env_log::test;
+    use test_log::test;
 
     #[test]
     fn pan_to_visible() {
         let mut viewport = Viewport {
             content_size: Size::new(400., 400.),
-            rect: Rect::from_origin_size((20., 20.), (20., 20.)),
+            view_size: (20., 20.).into(),
+            view_origin: (20., 20.).into(),
         };
 
         assert!(!viewport.pan_to_visible(Rect::from_origin_size((22., 22.,), (5., 5.))));
         assert!(viewport.pan_to_visible(Rect::from_origin_size((10., 10.,), (5., 5.))));
-        assert_eq!(viewport.rect.origin(), Point::new(10., 10.));
-        assert_eq!(viewport.rect.size(), Size::new(20., 20.));
+        assert_eq!(viewport.view_origin, Point::new(10., 10.));
+        assert_eq!(viewport.view_size, Size::new(20., 20.));
         assert!(!viewport.pan_to_visible(Rect::from_origin_size((10., 10.,), (50., 50.))));
-        assert_eq!(viewport.rect.origin(), Point::new(10., 10.));
+        assert_eq!(viewport.view_origin, Point::new(10., 10.));
 
         assert!(viewport.pan_to_visible(Rect::from_origin_size((30., 10.,), (5., 5.))));
-        assert_eq!(viewport.rect.origin(), Point::new(15., 10.));
+        assert_eq!(viewport.view_origin, Point::new(15., 10.));
         assert!(viewport.pan_to_visible(Rect::from_origin_size((5., 5.,), (5., 5.))));
-        assert_eq!(viewport.rect.origin(), Point::new(5., 5.));
+        assert_eq!(viewport.view_origin, Point::new(5., 5.));
     }
 }

@@ -14,6 +14,7 @@
 
 //! A widget which splits an area in two, with a settable ratio, and optional draggable resizing.
 
+use crate::debug_state::DebugState;
 use crate::kurbo::Line;
 use crate::widget::flex::Axis;
 use crate::widget::prelude::*;
@@ -30,8 +31,19 @@ pub struct Split<T> {
     min_bar_area: f64,    // Integers only
     solid: bool,
     draggable: bool,
+    /// The split bar is hovered by the mouse. This state is locked to `true` if the
+    /// widget is active (the bar is being dragged) to avoid cursor and painting jitter
+    /// if the mouse moves faster than the layout and temporarily gets outside of the
+    /// bar area while still being dragged.
+    is_bar_hover: bool,
+    /// Offset from the split point (bar center) to the actual mouse position when the
+    /// bar was clicked. This is used to ensure a click without mouse move is a no-op,
+    /// instead of re-centering the bar on the mouse.
+    click_offset: f64,
     child1: WidgetPod<T, Box<dyn Widget<T>>>,
+    old_bc_1: BoxConstraints,
     child2: WidgetPod<T, Box<dyn Widget<T>>>,
+    old_bc_2: BoxConstraints,
 }
 
 impl<T> Split<T> {
@@ -53,8 +65,12 @@ impl<T> Split<T> {
             min_bar_area: 6.0,
             solid: false,
             draggable: false,
+            is_bar_hover: false,
+            click_offset: 0.0,
             child1: WidgetPod::new(child1).boxed(),
+            old_bc_1: BoxConstraints::tight(Size::ZERO),
             child2: WidgetPod::new(child2).boxed(),
+            old_bc_2: BoxConstraints::tight(Size::ZERO),
         }
     }
 
@@ -147,6 +163,23 @@ impl<T> Split<T> {
     #[inline]
     fn bar_padding(&self) -> f64 {
         (self.bar_area() - self.bar_size) / 2.0
+    }
+
+    /// Returns the position of the split point (split bar center).
+    fn bar_position(&self, size: Size) -> f64 {
+        let bar_area = self.bar_area();
+        match self.split_axis {
+            Axis::Horizontal => {
+                let reduced_width = size.width - bar_area;
+                let edge1 = (reduced_width * self.split_point_effective).floor();
+                edge1 + bar_area / 2.0
+            }
+            Axis::Vertical => {
+                let reduced_height = size.height - bar_area;
+                let edge1 = (reduced_height * self.split_point_effective).floor();
+                edge1 + bar_area / 2.0
+            }
+        }
     }
 
     /// Returns the location of the edges of the splitter bar area,
@@ -284,31 +317,62 @@ impl<T: Data> Widget<T> for Split<T> {
             match event {
                 Event::MouseDown(mouse) => {
                     if mouse.button.is_left() && self.bar_hit_test(ctx.size(), mouse.pos) {
-                        ctx.set_active(true);
                         ctx.set_handled();
-                    }
-                }
-                Event::MouseUp(mouse) => {
-                    if mouse.button.is_left() && ctx.is_active() {
-                        ctx.set_active(false);
-                        self.update_split_point(ctx.size(), mouse.pos);
-                        ctx.request_paint();
-                    }
-                }
-                Event::MouseMove(mouse) => {
-                    if ctx.is_active() {
-                        self.update_split_point(ctx.size(), mouse.pos);
-                        ctx.request_layout();
-                    }
-
-                    if ctx.is_hot() || ctx.is_active() {
-                        if self.bar_hit_test(ctx.size(), mouse.pos) {
+                        ctx.set_active(true);
+                        // Save the delta between the mouse click position and the split point
+                        self.click_offset = match self.split_axis {
+                            Axis::Horizontal => mouse.pos.x,
+                            Axis::Vertical => mouse.pos.y,
+                        } - self.bar_position(ctx.size());
+                        // If not already hovering, force and change cursor appropriately
+                        if !self.is_bar_hover {
+                            self.is_bar_hover = true;
                             match self.split_axis {
                                 Axis::Horizontal => ctx.set_cursor(&Cursor::ResizeLeftRight),
                                 Axis::Vertical => ctx.set_cursor(&Cursor::ResizeUpDown),
                             };
-                        } else {
-                            ctx.clear_cursor();
+                        }
+                    }
+                }
+                Event::MouseUp(mouse) => {
+                    if mouse.button.is_left() && ctx.is_active() {
+                        ctx.set_handled();
+                        ctx.set_active(false);
+                        // Dependending on where the mouse cursor is when the button is released,
+                        // the cursor might or might not need to be changed
+                        self.is_bar_hover =
+                            ctx.is_hot() && self.bar_hit_test(ctx.size(), mouse.pos);
+                        if !self.is_bar_hover {
+                            ctx.clear_cursor()
+                        }
+                    }
+                }
+                Event::MouseMove(mouse) => {
+                    if ctx.is_active() {
+                        // If active, assume always hover/hot
+                        let effective_pos = match self.split_axis {
+                            Axis::Horizontal => {
+                                Point::new(mouse.pos.x - self.click_offset, mouse.pos.y)
+                            }
+                            Axis::Vertical => {
+                                Point::new(mouse.pos.x, mouse.pos.y - self.click_offset)
+                            }
+                        };
+                        self.update_split_point(ctx.size(), effective_pos);
+                        ctx.request_layout();
+                    } else {
+                        // If not active, set cursor when hovering state changes
+                        let hover = ctx.is_hot() && self.bar_hit_test(ctx.size(), mouse.pos);
+                        if hover != self.is_bar_hover {
+                            self.is_bar_hover = hover;
+                            if hover {
+                                match self.split_axis {
+                                    Axis::Horizontal => ctx.set_cursor(&Cursor::ResizeLeftRight),
+                                    Axis::Vertical => ctx.set_cursor(&Cursor::ResizeUpDown),
+                                };
+                            } else {
+                                ctx.clear_cursor();
+                            }
                         }
                     }
                 }
@@ -331,8 +395,8 @@ impl<T: Data> Widget<T> for Split<T> {
 
     #[instrument(name = "Split", level = "trace", skip(self, ctx, _old_data, data, env))]
     fn update(&mut self, ctx: &mut UpdateCtx, _old_data: &T, data: &T, env: &Env) {
-        self.child1.update(ctx, &data, env);
-        self.child2.update(ctx, &data, env);
+        self.child1.update(ctx, data, env);
+        self.child2.update(ctx, data, env);
     }
 
     #[instrument(name = "Split", level = "trace", skip(self, ctx, bc, data, env))]
@@ -405,8 +469,19 @@ impl<T: Data> Widget<T> for Split<T> {
                 )
             }
         };
-        let child1_size = self.child1.layout(ctx, &child1_bc, &data, env);
-        let child2_size = self.child2.layout(ctx, &child2_bc, &data, env);
+
+        let child1_size = if self.old_bc_1 != child1_bc || self.child1.layout_requested() {
+            self.child1.layout(ctx, &child1_bc, data, env)
+        } else {
+            self.child1.layout_rect().size()
+        };
+        self.old_bc_1 = child1_bc;
+        let child2_size = if self.old_bc_2 != child2_bc || self.child2.layout_requested() {
+            self.child2.layout(ctx, &child2_bc, data, env)
+        } else {
+            self.child2.layout_rect().size()
+        };
+        self.old_bc_2 = child2_bc;
 
         // Top-left align for both children, out of laziness.
         // Reduce our unsplit direction to the larger of the two widgets
@@ -439,7 +514,18 @@ impl<T: Data> Widget<T> for Split<T> {
         } else {
             self.paint_stroked_bar(ctx, env);
         }
-        self.child1.paint(ctx, &data, env);
-        self.child2.paint(ctx, &data, env);
+        self.child1.paint(ctx, data, env);
+        self.child2.paint(ctx, data, env);
+    }
+
+    fn debug_state(&self, data: &T) -> DebugState {
+        DebugState {
+            display_name: self.short_type_name().to_string(),
+            children: vec![
+                self.child1.widget().debug_state(data),
+                self.child2.widget().debug_state(data),
+            ],
+            ..Default::default()
+        }
     }
 }

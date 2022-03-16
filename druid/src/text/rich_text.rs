@@ -18,7 +18,7 @@ use std::ops::{Range, RangeBounds};
 use std::sync::Arc;
 
 use super::attribute::Link;
-use super::{Attribute, AttributeSpans, TextStorage};
+use super::{Attribute, AttributeSpans, EnvUpdateCtx, TextStorage};
 use crate::piet::{
     util, Color, FontFamily, FontStyle, FontWeight, PietTextLayoutBuilder, TextLayoutBuilder,
     TextStorage as PietTextStorage,
@@ -91,6 +91,10 @@ impl TextStorage for RichText {
             builder = builder.range_attribute(range, attr);
         }
         builder
+    }
+
+    fn env_update(&self, ctx: &EnvUpdateCtx) -> bool {
+        self.attrs.env_update(ctx)
     }
 
     fn links(&self) -> &[Link] {
@@ -198,7 +202,7 @@ impl AttributesAdder<'_> {
         self
     }
 
-    /// Add a forground color attribute.
+    /// Add a foreground color attribute.
     pub fn text_color(&mut self, color: impl Into<KeyOrValue<Color>>) -> &mut Self {
         self.add_attr(Attribute::text_color(color));
         self
@@ -225,6 +229,12 @@ impl AttributesAdder<'_> {
     /// Add a underline attribute.
     pub fn underline(&mut self, underline: bool) -> &mut Self {
         self.add_attr(Attribute::underline(underline));
+        self
+    }
+
+    /// Add a strikethrough attribute.
+    pub fn strikethrough(&mut self, strikethrough: bool) -> &mut Self {
+        self.add_attr(Attribute::Strikethrough(strikethrough));
         self
     }
 

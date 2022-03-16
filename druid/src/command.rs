@@ -25,18 +25,7 @@ use crate::{WidgetId, WindowId};
 /// The identity of a [`Selector`].
 ///
 /// [`Selector`]: struct.Selector.html
-#[derive(Copy, Clone, PartialEq, Eq)]
-pub(crate) struct SelectorSymbol {
-    str: &'static str,
-    must_use: bool,
-}
-
-impl std::fmt::Debug for SelectorSymbol {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let must_use = if self.must_use { " (must_use)" } else { "" };
-        write!(f, "{}{}", self.str, must_use)
-    }
-}
+pub(crate) type SelectorSymbol = &'static str;
 
 /// An identifier for a particular command.
 ///
@@ -77,7 +66,7 @@ pub struct Selector<T = ()>(SelectorSymbol, PhantomData<T>);
 ///
 /// let selector = Selector::new("process_rows");
 /// let rows = vec![1, 3, 10, 12];
-/// let command = Command::new(selector, rows, Target::Auto);
+/// let command = selector.with(rows);
 ///
 /// assert_eq!(command.get(selector), Some(&vec![1, 3, 10, 12]));
 /// ```
@@ -114,6 +103,8 @@ pub struct Notification {
     symbol: SelectorSymbol,
     payload: Arc<dyn Any>,
     source: WidgetId,
+    route: WidgetId,
+    warn_if_unused: bool,
 }
 
 /// A wrapper type for [`Command`] payloads that should only be used once.
@@ -129,7 +120,7 @@ pub struct Notification {
 ///
 /// let selector = Selector::new("use-once");
 /// let num = CantClone(42);
-/// let command = Command::new(selector, SingleUse::new(num), Target::Auto);
+/// let command = selector.with(SingleUse::new(num));
 ///
 /// let payload: &SingleUse<CantClone> = command.get_unchecked(selector);
 /// if let Some(num) = payload.take() {
@@ -154,21 +145,26 @@ pub enum Target {
     /// The `Command` will be delivered to all open windows, and all widgets
     /// in each window. Delivery will stop if the event is [`handled`].
     ///
-    /// [`handled`]: struct.EventCtx.html#set_handled
+    /// [`handled`]: crate::EventCtx::set_handled
     Global,
     /// The target is a specific window.
     ///
     /// The `Command` will be delivered to all widgets in that window.
     /// Delivery will stop if the event is [`handled`].
     ///
-    /// [`handled`]: struct.EventCtx.html#set_handled
+    /// [`handled`]: crate::EventCtx::set_handled
     Window(WindowId),
     /// The target is a specific widget.
     Widget(WidgetId),
     /// The target will be determined automatically.
     ///
     /// How this behaves depends on the context used to submit the command.
-    /// Each `submit_command` function should have documentation about the specific behavior.
+    /// If the command is submitted within a `Widget` method, then it will be sent to the host
+    /// window for that widget. If it is from outside the application, via [`ExtEventSink`],
+    /// or from the root [`AppDelegate`] then it will be sent to [`Target::Global`] .
+    ///
+    /// [`ExtEventSink`]: crate::ExtEventSink
+    /// [`AppDelegate`]: crate::AppDelegate
     Auto,
 }
 
@@ -183,16 +179,24 @@ pub mod sys {
     use super::Selector;
     use crate::{
         sub_window::{SubWindowDesc, SubWindowUpdate},
-        FileDialogOptions, FileInfo, SingleUse, WidgetId, WindowConfig,
+        FileDialogOptions, FileInfo, Rect, SingleUse, WidgetId, WindowConfig,
     };
 
     /// Quit the running application. This command is handled by the druid library.
     pub const QUIT_APP: Selector = Selector::new("druid-builtin.quit-app");
 
-    /// Hide the application. (mac only?)
+    /// Hide the application. (mac only)
+    #[cfg_attr(
+        not(target_os = "macos"),
+        deprecated = "HIDE_APPLICATION is only supported on macOS"
+    )]
     pub const HIDE_APPLICATION: Selector = Selector::new("druid-builtin.menu-hide-application");
 
-    /// Hide all other applications. (mac only?)
+    /// Hide all other applications. (mac only)
+    #[cfg_attr(
+        not(target_os = "macos"),
+        deprecated = "HIDE_OTHERS is only supported on macOS"
+    )]
     pub const HIDE_OTHERS: Selector = Selector::new("druid-builtin.menu-hide-others");
 
     /// The selector for a command to create a new window.
@@ -267,6 +271,11 @@ pub mod sys {
     /// [`FileInfo`]: ../struct.FileInfo.html
     pub const OPEN_FILE: Selector<FileInfo> = Selector::new("druid-builtin.open-file-path");
 
+    /// Open a path, must be handled by the application.
+    ///
+    /// [`FileInfo`]: ../struct.FileInfo.html
+    pub const OPEN_FILES: Selector<Vec<FileInfo>> = Selector::new("druid-builtin.open-files-path");
+
     /// When submitted by the application, the system will show the 'save as' panel,
     /// and if a path is selected the system will issue a [`SAVE_FILE`] command
     /// with the selected path as the payload.
@@ -326,6 +335,26 @@ pub mod sys {
     pub(crate) const INVALIDATE_IME: Selector<ImeInvalidation> =
         Selector::new("druid-builtin.invalidate-ime");
 
+    /// Informs this widget, that a child wants a specific region to be shown. The payload is the
+    /// requested region in global coordinates.
+    ///
+    /// This notification is send when [`scroll_to_view`] or [`scroll_area_to_view`]
+    /// are called.
+    ///
+    /// Widgets which hide their children, should always call `ctx.set_handled()` in response to
+    /// avoid unintended behaviour from widgets further down the tree.
+    /// If possible the widget should move its children to bring the area into view and then submit
+    /// a new `SCROLL_TO_VIEW` notification with the same region relative to the new child position.
+    ///
+    /// When building a new widget using ClipBox take a look at [`ClipBox::managed`] and
+    /// [`Viewport::default_scroll_to_view_handling`].
+    ///
+    /// [`scroll_to_view`]: crate::EventCtx::scroll_to_view()
+    /// [`scroll_area_to_view`]: crate::EventCtx::scroll_area_to_view()
+    /// [`ClipBox::managed`]: crate::widget::ClipBox::managed()
+    /// [`Viewport::default_scroll_to_view_handling`]: crate::widget::Viewport::default_scroll_to_view_handling()
+    pub const SCROLL_TO_VIEW: Selector<Rect> = Selector::new("druid-builtin.scroll-to");
+
     /// A change that has occured to text state, and needs to be
     /// communicated to the platform.
     pub(crate) struct ImeInvalidation {
@@ -348,25 +377,8 @@ impl Selector<()> {
 
 impl<T> Selector<T> {
     /// Create a new `Selector` with the given string.
-    pub const fn new(str: &'static str) -> Selector<T> {
-        Selector(
-            SelectorSymbol {
-                str,
-                must_use: false,
-            },
-            PhantomData,
-        )
-    }
-
-    /// Create a `Selector` that must be used.
-    pub const fn must_use(str: &'static str) -> Selector<T> {
-        Selector(
-            SelectorSymbol {
-                str,
-                must_use: true,
-            },
-            PhantomData,
-        )
+    pub const fn new(s: &'static str) -> Selector<T> {
+        Selector(s, PhantomData)
     }
 
     /// Returns the `SelectorSymbol` identifying this `Selector`.
@@ -382,11 +394,7 @@ impl<T: Any> Selector<T> {
     /// as `Selector<()>` implements `Into<Command>`.
     ///
     /// By default, the command will have [`Target::Auto`].
-    /// The [`Command::to`] method can be used to override this.
-    ///
-    /// [`Command::new`]: struct.Command.html#method.new
-    /// [`Command::to`]: struct.Command.html#method.to
-    /// [`Target::Auto`]: enum.Target.html#variant.Auto
+    /// The [`Selector::to`] method can be used to override this.
     pub fn with(self, payload: T) -> Command {
         Command::new(self, payload, Target::Auto)
     }
@@ -395,13 +403,9 @@ impl<T: Any> Selector<T> {
 impl Command {
     /// Create a new `Command` with a payload and a [`Target`].
     ///
-    /// [`Selector::with`] can be used to create `Command`s more conveniently.
+    /// [`Selector::with`] should be used to create `Command`s more conveniently.
     ///
     /// If you do not need a payload, [`Selector`] implements `Into<Command>`.
-    ///
-    /// [`Selector`]: struct.Selector.html
-    /// [`Selector::with`]: struct.Selector.html#method.with
-    /// [`Target`]: enum.Target.html
     pub fn new<T: Any>(selector: Selector<T>, payload: T, target: impl Into<Target>) -> Self {
         Command {
             symbol: selector.symbol(),
@@ -420,11 +424,6 @@ impl Command {
         .default_to(Target::Global)
     }
 
-    /// Checks if this command must be used.
-    pub fn must_be_used(&self) -> bool {
-        self.symbol.must_use
-    }
-
     /// A helper method for creating a `Notification` from a `Command`.
     ///
     /// This is slightly icky; it lets us do `SOME_SELECTOR.with(SOME_PAYLOAD)`
@@ -435,6 +434,8 @@ impl Command {
             symbol: self.symbol,
             payload: self.payload,
             source,
+            route: source,
+            warn_if_unused: true,
         }
     }
 
@@ -446,14 +447,6 @@ impl Command {
     /// [`Target`]: enum.Target.html
     pub fn to(mut self, target: impl Into<Target>) -> Self {
         self.target = target.into();
-        self
-    }
-
-    /// Make the `Command` must use.
-    ///
-    /// this will log warning if this `Command` is not handled.
-    pub fn must_use(mut self, must_use: bool) -> Self {
-        self.symbol.must_use = must_use;
         self
     }
 
@@ -495,7 +488,7 @@ impl Command {
         if self.symbol == selector.symbol() {
             Some(self.payload.downcast_ref().unwrap_or_else(|| {
                 panic!(
-                    "The selector {:?} exists twice with different types. See druid::Command::get for more information",
+                    "The selector \"{}\" exists twice with different types. See druid::Command::get for more information",
                     selector.symbol()
                 );
             }))
@@ -521,7 +514,7 @@ impl Command {
     pub fn get_unchecked<T: Any>(&self, selector: Selector<T>) -> &T {
         self.get(selector).unwrap_or_else(|| {
             panic!(
-                "Expected selector {:?} but the command was {:?}.",
+                "Expected selector \"{}\" but the command was \"{}\".",
                 selector.symbol(),
                 self.symbol
             )
@@ -548,7 +541,7 @@ impl Notification {
         if self.symbol == selector.symbol() {
             Some(self.payload.downcast_ref().unwrap_or_else(|| {
                 panic!(
-                    "The selector {:?} exists twice with different types. \
+                    "The selector \"{}\" exists twice with different types. \
                     See druid::Command::get for more information",
                     selector.symbol()
                 );
@@ -563,6 +556,47 @@ impl Notification {
     /// [`Widget`]: crate::Widget
     pub fn source(&self) -> WidgetId {
         self.source
+    }
+
+    /// Builder-style method to set warn_if_unused.
+    ///
+    /// The default is true.
+    pub fn warn_if_unused(mut self, warn_if_unused: bool) -> Self {
+        self.warn_if_unused = warn_if_unused;
+        self
+    }
+
+    /// Returns whether there should be a warning when no widget handles this notification.
+    pub fn warn_if_unused_set(&self) -> bool {
+        self.warn_if_unused
+    }
+
+    /// Change the route id
+    pub(crate) fn with_route(mut self, widget_id: WidgetId) -> Self {
+        self.route = widget_id;
+        self
+    }
+
+    /// The [`WidgetId`] of the last [`Widget`] that this [`Notification`] was passed through.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// fn event(&mut self, ctx: &mut EventCtx, event: &Event, data: &mut (), env: &Env) {
+    ///     if let Event::Notification(notification) = event {
+    ///         if notification.route() == self.widget1.id() {
+    ///             // the notification came from inside of widget1
+    ///         }
+    ///         if notification.route() == self.widget2.id() {
+    ///             // the notification came from inside of widget2
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// [`Widget`]: crate::Widget
+    pub fn route(&self) -> WidgetId {
+        self.route
     }
 }
 
@@ -590,7 +624,7 @@ impl From<Selector> for Command {
 
 impl<T> std::fmt::Display for Selector<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "Selector({:?}, {})", self.0, any::type_name::<T>())
+        write!(f, "Selector(\"{}\", {})", self.0, any::type_name::<T>())
     }
 }
 
@@ -640,7 +674,7 @@ impl std::fmt::Debug for Notification {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "Notification: Selector {:?} from {:?}",
+            "Notification: Selector {} from {:?}",
             self.symbol, self.source
         )
     }
@@ -649,13 +683,13 @@ impl std::fmt::Debug for Notification {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use test_env_log::test;
+    use test_log::test;
 
     #[test]
     fn get_payload() {
         let sel = Selector::new("my-selector");
         let payload = vec![0, 1, 2];
-        let command = Command::new(sel, payload, Target::Auto);
+        let command = sel.with(payload);
         assert_eq!(command.get(sel), Some(&vec![0, 1, 2]));
     }
 

@@ -53,7 +53,7 @@ pub(crate) const EXT_EVENT_IDLE_TOKEN: IdleToken = IdleToken::new(2);
 /// it publicly.
 pub struct DruidHandler<T> {
     /// The shared app state.
-    app_state: AppState<T>,
+    pub(crate) app_state: AppState<T>,
     /// The id for the current window.
     window_id: WindowId,
 }
@@ -71,7 +71,7 @@ pub(crate) struct AppHandler<T> {
 /// State shared by all windows in the UI.
 #[derive(Clone)]
 pub(crate) struct AppState<T> {
-    inner: Rc<RefCell<Inner<T>>>,
+    inner: Rc<RefCell<InnerAppState<T>>>,
 }
 
 /// The information for forwarding druid-shell's file dialog reply to the right place.
@@ -80,11 +80,13 @@ struct DialogInfo {
     id: WindowId,
     /// The command to send if the dialog is accepted.
     accept_cmd: Selector<FileInfo>,
+    /// The command to send if the dialog is accepted with multiple files.
+    accept_multiple_cmd: Selector<Vec<FileInfo>>,
     /// The command to send if the dialog is cancelled.
     cancel_cmd: Selector<()>,
 }
 
-struct Inner<T> {
+struct InnerAppState<T> {
     app: Application,
     delegate: Option<Box<dyn AppDelegate<T>>>,
     command_queue: CommandQueue,
@@ -96,7 +98,7 @@ struct Inner<T> {
     root_menu: Option<MenuManager<T>>,
     /// The id of the most-recently-focused window that has a menu. On macOS, this
     /// is the window that's currently in charge of the app menu.
-    #[allow(unused_variables)]
+    #[allow(unused)]
     menu_window: Option<WindowId>,
     pub(crate) env: Env,
     pub(crate) data: T,
@@ -158,7 +160,7 @@ impl<T> AppState<T> {
         delegate: Option<Box<dyn AppDelegate<T>>>,
         ext_event_host: ExtEventHost,
     ) -> Self {
-        let inner = Rc::new(RefCell::new(Inner {
+        let inner = Rc::new(RefCell::new(InnerAppState {
             app,
             delegate,
             command_queue: VecDeque::new(),
@@ -180,7 +182,7 @@ impl<T> AppState<T> {
     }
 }
 
-impl<T: Data> Inner<T> {
+impl<T: Data> InnerAppState<T> {
     fn handle_menu_cmd(&mut self, cmd_id: MenuItemId, window_id: Option<WindowId>) {
         let queue = &mut self.command_queue;
         let data = &mut self.data;
@@ -208,7 +210,7 @@ impl<T: Data> Inner<T> {
     where
         F: FnOnce(&mut dyn AppDelegate<T>, &mut T, &Env, &mut DelegateCtx) -> R,
     {
-        let Inner {
+        let InnerAppState {
             ref mut delegate,
             ref mut command_queue,
             ref mut data,
@@ -221,11 +223,9 @@ impl<T: Data> Inner<T> {
             app_data_type: TypeId::of::<T>(),
             ext_event_host,
         };
-        if let Some(delegate) = delegate.as_deref_mut() {
-            Some(f(delegate, data, env, &mut ctx))
-        } else {
-            None
-        }
+        delegate
+            .as_deref_mut()
+            .map(|delegate| f(delegate, data, env, &mut ctx))
     }
 
     fn delegate_event(&mut self, id: WindowId, event: Event) -> Option<Event> {
@@ -244,7 +244,7 @@ impl<T: Data> Inner<T> {
 
     fn connect(&mut self, id: WindowId, handle: WindowHandle) {
         self.windows
-            .connect(id, handle, self.ext_event_host.make_sink());
+            .connect(id, handle.clone(), self.ext_event_host.make_sink());
 
         // If the external event host has no handle, it cannot wake us
         // when an event arrives.
@@ -252,7 +252,7 @@ impl<T: Data> Inner<T> {
             self.set_ext_event_idle_handler(id);
         }
 
-        self.with_delegate(|del, data, env, ctx| del.window_added(id, data, env, ctx));
+        self.with_delegate(|del, data, env, ctx| del.window_added(id, handle, data, env, ctx));
     }
 
     /// Called after this window has been closed by the platform.
@@ -476,6 +476,8 @@ impl<T: Data> Inner<T> {
 
         #[cfg(target_os = "macos")]
         {
+            use druid_shell::platform::mac::ApplicationExt as _;
+
             let windows = &mut self.windows;
             let window = self.menu_window.and_then(|w| windows.get_mut(w));
             if let Some(window) = window {
@@ -613,6 +615,12 @@ impl<T: Data> AppState<T> {
         }
     }
 
+    pub(crate) fn handle_idle_callback(&mut self, cb: impl FnOnce(&mut T)) {
+        let mut inner = self.inner.borrow_mut();
+        cb(&mut inner.data);
+        inner.do_update();
+    }
+
     fn process_commands(&mut self) {
         loop {
             let next_cmd = self.inner.borrow_mut().command_queue.pop_front();
@@ -654,7 +662,9 @@ impl<T: Data> AppState<T> {
         match cmd.target() {
             // these are handled the same no matter where they come from
             _ if cmd.is(sys_cmd::QUIT_APP) => self.quit(),
+            #[cfg(target_os = "macos")]
             _ if cmd.is(sys_cmd::HIDE_APPLICATION) => self.hide_app(),
+            #[cfg(target_os = "macos")]
             _ if cmd.is(sys_cmd::HIDE_OTHERS) => self.hide_others(),
             _ if cmd.is(sys_cmd::NEW_WINDOW) => {
                 if let Err(e) = self.new_window(cmd) {
@@ -686,11 +696,11 @@ impl<T: Data> AppState<T> {
             _ if cmd.is(sys_cmd::SHOW_WINDOW) => {
                 tracing::warn!("SHOW_WINDOW command must target a window.")
             }
+            _ if cmd.is(sys_cmd::SHOW_OPEN_PANEL) => {
+                tracing::warn!("SHOW_OPEN_PANEL command must target a window.")
+            }
             _ => {
-                let handled = self.inner.borrow_mut().dispatch_cmd(cmd.clone());
-                if !handled.is_handled() && cmd.must_be_used() {
-                    tracing::warn!("{:?} was not handled.", cmd);
-                }
+                self.inner.borrow_mut().dispatch_cmd(cmd);
             }
         }
     }
@@ -705,6 +715,9 @@ impl<T: Data> AppState<T> {
             .map(|w| w.handle.clone());
 
         let accept_cmd = options.accept_cmd.unwrap_or(crate::commands::OPEN_FILE);
+        let accept_multiple_cmd = options
+            .accept_multiple_cmd
+            .unwrap_or(crate::commands::OPEN_FILES);
         let cancel_cmd = options
             .cancel_cmd
             .unwrap_or(crate::commands::OPEN_PANEL_CANCELLED);
@@ -715,6 +728,7 @@ impl<T: Data> AppState<T> {
                 DialogInfo {
                     id: window_id,
                     accept_cmd,
+                    accept_multiple_cmd,
                     cancel_cmd,
                 },
             );
@@ -730,6 +744,9 @@ impl<T: Data> AppState<T> {
             .get_mut(window_id)
             .map(|w| w.handle.clone());
         let accept_cmd = options.accept_cmd.unwrap_or(crate::commands::SAVE_FILE_AS);
+        let accept_multiple_cmd = options
+            .accept_multiple_cmd
+            .unwrap_or(crate::commands::OPEN_FILES);
         let cancel_cmd = options
             .cancel_cmd
             .unwrap_or(crate::commands::SAVE_PANEL_CANCELLED);
@@ -740,10 +757,35 @@ impl<T: Data> AppState<T> {
                 DialogInfo {
                     id: window_id,
                     accept_cmd,
+                    accept_multiple_cmd,
                     cancel_cmd,
                 },
             );
         }
+    }
+    fn handle_dialog_multiple_response(
+        &mut self,
+        token: FileDialogToken,
+        file_info: Vec<FileInfo>,
+    ) {
+        let mut inner = self.inner.borrow_mut();
+        if let Some(dialog_info) = inner.file_dialogs.remove(&token) {
+            let cmd = if !file_info.is_empty() {
+                dialog_info
+                    .accept_multiple_cmd
+                    .with(file_info)
+                    .to(dialog_info.id)
+            } else {
+                dialog_info.cancel_cmd.to(dialog_info.id)
+            };
+            inner.append_command(cmd);
+        } else {
+            tracing::error!("unknown dialog token");
+        }
+
+        std::mem::drop(inner);
+        self.process_commands();
+        self.inner.borrow_mut().do_update();
     }
 
     fn handle_dialog_response(&mut self, token: FileDialogToken, file_info: Option<FileInfo>) {
@@ -837,14 +879,16 @@ impl<T: Data> AppState<T> {
         self.inner.borrow().app.quit()
     }
 
+    #[cfg(target_os = "macos")]
     fn hide_app(&self) {
-        #[cfg(target_os = "macos")]
+        use druid_shell::platform::mac::ApplicationExt as _;
         self.inner.borrow().app.hide()
     }
 
+    #[cfg(target_os = "macos")]
     fn hide_others(&mut self) {
-        #[cfg(target_os = "macos")]
-        self.inner.borrow().app.hide_others()
+        use druid_shell::platform::mac::ApplicationExt as _;
+        self.inner.borrow().app.hide_others();
     }
 
     pub(crate) fn build_native_window(
@@ -921,6 +965,11 @@ impl<T: Data> WinHandler for DruidHandler<T> {
 
     fn open_file(&mut self, token: FileDialogToken, file_info: Option<FileInfo>) {
         self.app_state.handle_dialog_response(token, file_info);
+    }
+
+    fn open_files(&mut self, token: FileDialogToken, file_info: Vec<FileInfo>) {
+        self.app_state
+            .handle_dialog_multiple_response(token, file_info);
     }
 
     fn mouse_down(&mut self, event: &MouseEvent) {

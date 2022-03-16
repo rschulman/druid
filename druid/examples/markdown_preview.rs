@@ -14,7 +14,10 @@
 
 //! An example of live markdown preview
 
-use pulldown_cmark::{Event as ParseEvent, Parser, Tag};
+// On Windows platform, don't show a console when opening the app.
+#![windows_subsystem = "windows"]
+
+use pulldown_cmark::{Event as ParseEvent, Options, Parser, Tag};
 
 use druid::text::{AttributesAdder, RichText, RichTextBuilder};
 use druid::widget::prelude::*;
@@ -29,12 +32,10 @@ const WINDOW_TITLE: LocalizedString<AppState> = LocalizedString::new("Minimal Ma
 
 const TEXT: &str = "*Hello* ***world***! This is a `TextBox` where you can \
 		    use limited markdown notation, which is reflected in the \
-		    **styling** of the `Label` on the left.
-
+		    **styling** of the `Label` on the left. ~~Strikethrough even works!~~\n\n\
 		    If you're curious about Druid, a good place to ask questions \
 		    and discuss development work is our [Zulip chat instance], \
 		    in the #druid-help and #druid channels, respectively.\n\n\n\
-		    
 		    [Zulip chat instance]: https://xi.zulipchat.com";
 
 const SPACER_SIZE: f64 = 8.0;
@@ -140,7 +141,7 @@ fn rebuild_rendered_text(text: &str) -> RichText {
     let mut builder = RichTextBuilder::new();
     let mut tag_stack = Vec::new();
 
-    let parser = Parser::new(text);
+    let parser = Parser::new_ext(text, Options::ENABLE_STRIKETHROUGH);
     for event in parser {
         match event {
             ParseEvent::Start(tag) => {
@@ -217,6 +218,9 @@ fn add_attribute_for_tag(tag: &Tag, mut attrs: AttributesAdder) {
         Tag::Strong => {
             attrs.weight(FontWeight::BOLD);
         }
+        Tag::Strikethrough => {
+            attrs.strikethrough(true);
+        }
         Tag::Link(_link_ty, target, _title) => {
             attrs
                 .underline(true)
@@ -235,7 +239,7 @@ fn make_menu<T: Data>(_window_id: Option<WindowId>, _app_state: &AppState, _env:
     {
         base = base.entry(druid::platform_menus::mac::application::default())
     }
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "openbsd"))]
     {
         base = base.entry(druid::platform_menus::win::file::default());
     }

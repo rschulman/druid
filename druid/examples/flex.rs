@@ -17,7 +17,10 @@
 //! knobs to change all the parameters. 99% of the time you will want to
 //! hard-code these parameters, which will simplify your code considerably.
 
-use druid::text::format::ParseFormatter;
+// On Windows platform, don't show a console when opening the app.
+#![windows_subsystem = "windows"]
+
+use druid::text::ParseFormatter;
 use druid::widget::prelude::*;
 use druid::widget::{
     Button, Checkbox, CrossAxisAlignment, Flex, Label, MainAxisAlignment, ProgressBar, RadioGroup,
@@ -40,11 +43,12 @@ const MAIN_AXIS_ALIGNMENT_OPTIONS: [(&str, MainAxisAlignment); 6] = [
     ("Evenly", MainAxisAlignment::SpaceEvenly),
     ("Around", MainAxisAlignment::SpaceAround),
 ];
-const CROSS_AXIS_ALIGNMENT_OPTIONS: [(&str, CrossAxisAlignment); 4] = [
+const CROSS_AXIS_ALIGNMENT_OPTIONS: [(&str, CrossAxisAlignment); 5] = [
     ("Start", CrossAxisAlignment::Start),
     ("Center", CrossAxisAlignment::Center),
     ("End", CrossAxisAlignment::End),
     ("Baseline", CrossAxisAlignment::Baseline),
+    ("Fill", CrossAxisAlignment::Fill),
 ];
 const FLEX_TYPE_OPTIONS: [(&str, FlexType); 2] =
     [("Row", FlexType::Row), ("Column", FlexType::Column)];

@@ -16,13 +16,14 @@
 
 use std::{
     any::{Any, TypeId},
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     ops::{Deref, DerefMut},
     rc::Rc,
     time::Duration,
 };
 use tracing::{error, trace, warn};
 
+use crate::commands::SCROLL_TO_VIEW;
 use crate::core::{CommandQueue, CursorChange, FocusChange, WidgetState};
 use crate::env::KeyLike;
 use crate::menu::ContextMenu;
@@ -60,6 +61,8 @@ pub(crate) struct ContextState<'a> {
     /// The id of the widget that currently has focus.
     pub(crate) focus_widget: Option<WidgetId>,
     pub(crate) root_app_data_type: TypeId,
+    pub(crate) timers: &'a mut HashMap<TimerToken, WidgetId>,
+    pub(crate) text_registrations: &'a mut Vec<TextFieldRegistration>,
 }
 
 /// A mutable context provided to event handling methods of widgets.
@@ -154,7 +157,7 @@ impl_context_method!(
 
         /// Returns a reference to the current `WindowHandle`.
         pub fn window(&self) -> &WindowHandle {
-            &self.state.window
+            self.state.window
         }
 
         /// Get the `WindowId` of the current window.
@@ -276,6 +279,23 @@ impl_context_method!(
         pub fn has_focus(&self) -> bool {
             self.widget_state.has_focus
         }
+
+        /// The disabled state of a widget.
+        ///
+        /// Returns `true` if this widget or any of its ancestors is explicitly disabled.
+        /// To make this widget explicitly disabled use [`set_disabled`].
+        ///
+        /// Disabled means that this widget should not change the state of the application. What
+        /// that means is not entirely clear but in any it should not change its data. Therefore
+        /// others can use this as a safety mechanism to prevent the application from entering an
+        /// illegal state.
+        /// For an example the decrease button of a counter of type `usize` should be disabled if the
+        /// value is `0`.
+        ///
+        /// [`set_disabled`]: EventCtx::set_disabled
+        pub fn is_disabled(&self) -> bool {
+            self.widget_state.is_disabled()
+        }
     }
 );
 
@@ -370,11 +390,30 @@ impl_context_method!(EventCtx<'_, '_>, UpdateCtx<'_, '_>, LifeCycleCtx<'_, '_>, 
 
     /// Indicate that your children have changed.
     ///
-    /// Widgets must call this method after adding a new child.
+    /// Widgets must call this method after adding a new child, removing a child or changing which
+    /// children are hidden (see [`should_propagate_to_hidden`]).
+    ///
+    /// [`should_propagate_to_hidden`]: crate::Event::should_propagate_to_hidden
     pub fn children_changed(&mut self) {
         trace!("children_changed");
         self.widget_state.children_changed = true;
+        self.widget_state.update_focus_chain = true;
         self.request_layout();
+    }
+
+    /// Set the disabled state for this widget.
+    ///
+    /// Setting this to `false` does not mean a widget is not still disabled; for instance it may
+    /// still be disabled by an ancestor. See [`is_disabled`] for more information.
+    ///
+    /// Calling this method during [`LifeCycle::DisabledChanged`] has no effect.
+    ///
+    /// [`LifeCycle::DisabledChanged`]: struct.LifeCycle.html#variant.DisabledChanged
+    /// [`is_disabled`]: EventCtx::is_disabled
+    pub fn set_disabled(&mut self, disabled: bool) {
+        // widget_state.children_disabled_changed is not set because we want to be able to delete
+        // changes that happened during DisabledChanged.
+        self.widget_state.is_explicitly_disabled_new = disabled;
     }
 
     /// Indicate that text input state has changed.
@@ -417,6 +456,23 @@ impl_context_method!(EventCtx<'_, '_>, UpdateCtx<'_, '_>, LifeCycleCtx<'_, '_>, 
         self.submit_command(commands::NEW_SUB_WINDOW.with(SingleUse::new(req)));
         window_id
     }
+
+    /// Scrolls this widget into view.
+    ///
+    /// If this widget is only partially visible or not visible at all because of [`Scroll`]s
+    /// it is wrapped in, they will do the minimum amount of scrolling necessary to bring this
+    /// widget fully into view.
+    ///
+    /// If the widget is [`hidden`], this method has no effect.
+    ///
+    /// This functionality is achieved by sending a [`SCROLL_TO_VIEW`] notification.
+    ///
+    /// [`Scroll`]: crate::widget::Scroll
+    /// [`hidden`]: crate::Event::should_propagate_to_hidden
+    /// [`SCROLL_TO_VIEW`]: crate::commands::SCROLL_TO_VIEW
+    pub fn scroll_to_view(&mut self) {
+        self.scroll_area_to_view(self.size().to_rect())
+    }
 });
 
 // methods on everyone but paintctx
@@ -457,7 +513,7 @@ impl_context_method!(
         /// request with the event.
         pub fn request_timer(&mut self, deadline: Duration) -> TimerToken {
             trace!("request_timer deadline={:?}", deadline);
-            self.state.request_timer(&mut self.widget_state, deadline)
+            self.state.request_timer(self.widget_state.id, deadline)
         }
     }
 );
@@ -489,6 +545,23 @@ impl EventCtx<'_, '_> {
     pub fn submit_notification(&mut self, note: impl Into<Command>) {
         trace!("submit_notification");
         let note = note.into().into_notification(self.widget_state.id);
+        self.notifications.push_back(note);
+    }
+
+    /// Submit a [`Notification`] without warning.
+    ///
+    /// In contrast to [`submit_notification`], calling this method will not result in an
+    /// "unhandled notification" warning.
+    ///
+    /// [`submit_notification`]: crate::EventCtx::submit_notification
+    //TODO: decide if we should use a known_target flag on submit_notification instead,
+    // which would be a breaking change.
+    pub fn submit_notification_without_warning(&mut self, note: impl Into<Command>) {
+        trace!("submit_notification");
+        let note = note
+            .into()
+            .into_notification(self.widget_state.id)
+            .warn_if_unused(false);
         self.notifications.push_back(note);
     }
 
@@ -650,6 +723,23 @@ impl EventCtx<'_, '_> {
         trace!("request_update");
         self.widget_state.request_update = true;
     }
+
+    /// Scrolls the area into view.
+    ///
+    /// If the area is only partially visible or not visible at all because of [`Scroll`]s
+    /// this widget is wrapped in, they will do the minimum amount of scrolling necessary to
+    /// bring the area fully into view.
+    ///
+    /// If the widget is [`hidden`], this method has no effect.
+    ///
+    /// [`Scroll`]: crate::widget::Scroll
+    /// [`hidden`]: crate::Event::should_propagate_to_hidden
+    pub fn scroll_area_to_view(&mut self, area: Rect) {
+        //TODO: only do something if this widget is not hidden
+        self.submit_notification_without_warning(
+            SCROLL_TO_VIEW.with(area + self.window_origin().to_vec2()),
+        );
+    }
 }
 
 impl UpdateCtx<'_, '_> {
@@ -689,6 +779,25 @@ impl UpdateCtx<'_, '_> {
             None => false,
         }
     }
+
+    /// Scrolls the area into view.
+    ///
+    /// If the area is only partially visible or not visible at all because of [`Scroll`]s
+    /// this widget is wrapped in, they will do the minimum amount of scrolling necessary to
+    /// bring the area fully into view.
+    ///
+    /// If the widget is [`hidden`], this method has no effect.
+    ///
+    /// [`Scroll`]: crate::widget::Scroll
+    /// [`hidden`]: crate::Event::should_propagate_to_hidden
+    pub fn scroll_area_to_view(&mut self, area: Rect) {
+        //TODO: only do something if this widget is not hidden
+        self.submit_command(Command::new(
+            SCROLL_TO_VIEW,
+            area + self.window_origin().to_vec2(),
+            self.widget_id(),
+        ));
+    }
 }
 
 impl LifeCycleCtx<'_, '_> {
@@ -705,11 +814,11 @@ impl LifeCycleCtx<'_, '_> {
 
     /// Register this widget to be eligile to accept focus automatically.
     ///
-    /// This should only be called in response to a [`LifeCycle::WidgetAdded`] event.
+    /// This should only be called in response to a [`LifeCycle::BuildFocusChain`] event.
     ///
     /// See [`EventCtx::is_focused`] for more information about focus.
     ///
-    /// [`LifeCycle::WidgetAdded`]: enum.Lifecycle.html#variant.WidgetAdded
+    /// [`LifeCycle::BuildFocusChain`]: enum.Lifecycle.html#variant.BuildFocusChain
     /// [`EventCtx::is_focused`]: struct.EventCtx.html#method.is_focused
     pub fn register_for_focus(&mut self) {
         trace!("register_for_focus");
@@ -722,7 +831,26 @@ impl LifeCycleCtx<'_, '_> {
             document: Rc::new(document),
             widget_id: self.widget_id(),
         };
-        self.widget_state.text_registrations.push(registration);
+        self.state.text_registrations.push(registration);
+    }
+
+    /// Scrolls the area into view.
+    ///
+    /// If the area is only partially visible or not visible at all because of [`Scroll`]s
+    /// this widget is wrapped in, they will do the minimum amount of scrolling necessary to
+    /// bring the area fully into view.
+    ///
+    /// If the widget is [`hidden`], this method has no effect.
+    ///
+    /// [`Scroll`]: crate::widget::Scroll
+    /// [`hidden`]: crate::Event::should_propagate_to_hidden
+    pub fn scroll_area_to_view(&mut self, area: Rect) {
+        //TODO: only do something if this widget is not hidden
+        self.submit_command(
+            SCROLL_TO_VIEW
+                .with(area + self.window_origin().to_vec2())
+                .to(self.widget_id()),
+        );
     }
 }
 
@@ -856,6 +984,8 @@ impl<'a> ContextState<'a> {
         window: &'a WindowHandle,
         window_id: WindowId,
         focus_widget: Option<WidgetId>,
+        timers: &'a mut HashMap<TimerToken, WidgetId>,
+        text_registrations: &'a mut Vec<TextFieldRegistration>,
     ) -> Self {
         ContextState {
             command_queue,
@@ -863,6 +993,8 @@ impl<'a> ContextState<'a> {
             window,
             window_id,
             focus_widget,
+            timers,
+            text_registrations,
             text: window.text(),
             root_app_data_type: TypeId::of::<T>(),
         }
@@ -874,10 +1006,10 @@ impl<'a> ContextState<'a> {
             .push_back(command.default_to(self.window_id.into()));
     }
 
-    fn request_timer(&self, widget_state: &mut WidgetState, deadline: Duration) -> TimerToken {
+    fn request_timer(&mut self, widget_id: WidgetId, deadline: Duration) -> TimerToken {
         trace!("request_timer deadline={:?}", deadline);
         let timer_token = self.window.request_timer(deadline);
-        widget_state.add_timer(timer_token);
+        self.timers.insert(timer_token, widget_id);
         timer_token
     }
 }

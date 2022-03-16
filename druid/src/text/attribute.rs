@@ -19,6 +19,8 @@ use std::ops::Range;
 use crate::piet::{Color, FontFamily, FontStyle, FontWeight, TextAttribute as PietAttr};
 use crate::{Command, Env, FontDescriptor, KeyOrValue};
 
+use super::EnvUpdateCtx;
+
 /// A clickable range of text with an associated [`Command`].
 #[derive(Debug, Clone)]
 pub struct Link {
@@ -37,6 +39,7 @@ pub struct AttributeSpans {
     fg_color: SpanSet<KeyOrValue<Color>>,
     style: SpanSet<FontStyle>,
     underline: SpanSet<bool>,
+    strikethrough: SpanSet<bool>,
     font_descriptor: SpanSet<KeyOrValue<FontDescriptor>>,
 }
 
@@ -98,6 +101,8 @@ pub enum Attribute {
     Style(FontStyle),
     /// Underline.
     Underline(bool),
+    /// Strikethrough
+    Strikethrough(bool),
     /// A [`FontDescriptor`](struct.FontDescriptor.html).
     Descriptor(KeyOrValue<FontDescriptor>),
 }
@@ -129,6 +134,7 @@ impl AttributeSpans {
             Attribute::TextColor(attr) => self.fg_color.add(Span::new(range, attr)),
             Attribute::Style(attr) => self.style.add(Span::new(range, attr)),
             Attribute::Underline(attr) => self.underline.add(Span::new(range, attr)),
+            Attribute::Strikethrough(attr) => self.strikethrough.add(Span::new(range, attr)),
             Attribute::Descriptor(attr) => self.font_descriptor.add(Span::new(range, attr)),
         }
     }
@@ -173,11 +179,30 @@ impl AttributeSpans {
                 .iter()
                 .map(|s| (s.range.clone(), PietAttr::Underline(s.attr))),
         );
+        items.extend(
+            self.strikethrough
+                .iter()
+                .map(|s| (s.range.clone(), PietAttr::Strikethrough(s.attr))),
+        );
 
         // sort by ascending start order; this is a stable sort
         // so items that come from FontDescriptor will stay at the front
         items.sort_by(|a, b| a.0.start.cmp(&b.0.start));
         items
+    }
+
+    pub(crate) fn env_update(&self, ctx: &EnvUpdateCtx) -> bool {
+        self.size
+            .iter()
+            .any(|span_attr| ctx.env_key_changed(&span_attr.attr))
+            || self
+                .fg_color
+                .iter()
+                .any(|span_attr| ctx.env_key_changed(&span_attr.attr))
+            || self
+                .font_descriptor
+                .iter()
+                .any(|span_attr| ctx.env_key_changed(&span_attr.attr))
     }
 }
 
@@ -197,7 +222,7 @@ impl<T: Clone> SpanSet<T> {
             .spans
             .iter()
             .position(|x| x.range.start >= span.range.start)
-            .unwrap_or_else(|| self.spans.len());
+            .unwrap_or(self.spans.len());
 
         // if we are inserting into the middle of an existing span we need
         // to add the trailing portion back afterwards.
@@ -238,10 +263,11 @@ impl<T: Clone> SpanSet<T> {
     ///
     /// `new_len` is the length of the inserted text.
     //TODO: we could be smarter here about just extending the existing spans
-    //as requred for insertions in the interior of a span.
+    //as required for insertions in the interior of a span.
     //TODO: this isn't currently used; it should be used if we use spans with
     //some editable type.
-    #[allow(dead_code)]
+    // the branches are much more readable without sharing code
+    #[allow(dead_code, clippy::branches_sharing_code)]
     fn edit(&mut self, changed: Range<usize>, new_len: usize) {
         let old_len = changed.len();
         let mut to_insert = None;
@@ -305,7 +331,7 @@ impl Attribute {
         Attribute::FontSize(size.into())
     }
 
-    /// Create a new forground color attribute.
+    /// Create a new foreground color attribute.
     pub fn text_color(color: impl Into<KeyOrValue<Color>>) -> Self {
         Attribute::TextColor(color.into())
     }
@@ -330,6 +356,11 @@ impl Attribute {
         Attribute::Underline(underline)
     }
 
+    /// Create a new strikethrough attribute.
+    pub fn strikethrough(strikethrough: bool) -> Self {
+        Attribute::Strikethrough(strikethrough)
+    }
+
     /// Create a new `FontDescriptor` attribute.
     pub fn font_descriptor(font: impl Into<KeyOrValue<FontDescriptor>>) -> Self {
         Attribute::Descriptor(font.into())
@@ -345,7 +376,7 @@ impl<T> Default for SpanSet<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use test_env_log::test;
+    use test_log::test;
 
     #[test]
     fn smoke_test_spans() {

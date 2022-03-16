@@ -19,10 +19,10 @@ use tracing::{instrument, trace};
 
 use crate::{
     kurbo::BezPath,
-    piet::{self, FixedLinearGradient, GradientStop, LineCap, LineJoin, StrokeStyle},
+    piet::{self, GradientStop, LineCap, LineJoin, LinearGradient, RadialGradient, StrokeStyle},
     widget::common::FillStrat,
     widget::prelude::*,
-    Affine, Color, Data, Point, Rect,
+    Affine, Color, Data, Rect, UnitPoint,
 };
 
 /// A widget that renders a SVG
@@ -42,7 +42,7 @@ impl Svg {
         }
     }
 
-    /// A builder-style method for specifying the fill strategy.
+    /// Builder-style method for specifying the fill strategy.
     pub fn fill_mode(mut self, mode: FillStrat) -> Self {
         self.fill = mode;
         self
@@ -51,6 +51,11 @@ impl Svg {
     /// Modify the widget's `FillStrat`.
     pub fn set_fill_mode(&mut self, newfil: FillStrat) {
         self.fill = newfil;
+    }
+
+    /// Set the svg data.
+    pub fn set_svg_data(&mut self, svg_data: SvgData) {
+        self.svg_data = svg_data;
     }
 }
 
@@ -103,7 +108,7 @@ impl<T: Data> Widget<T> for Svg {
 
 /// Stored SVG data.
 /// Implements `FromStr` and can be converted to piet draw instructions.
-#[derive(Clone)]
+#[derive(Clone, Data)]
 pub struct SvgData {
     tree: Arc<usvg::Tree>,
 }
@@ -139,22 +144,8 @@ impl SvgData {
         }
     }
 
-    /// Calculates the transform that should be applied first to the svg path data, to convert from
-    /// image coordinates to piet coordinates.
-    fn inner_affine(&self) -> Affine {
-        let viewbox = self.viewbox();
-        let size = self.size();
-        // we want to move the viewbox top left to (0,0) and then scale it from viewbox size to
-        // size.
-        // TODO respect preserveAspectRatio
-        let t = Affine::translate((viewbox.min_x(), viewbox.min_y()));
-        let scale =
-            Affine::scale_non_uniform(size.width / viewbox.width(), size.height / viewbox.height());
-        scale * t
-    }
-
     /// Get the viewbox for the svg. This is the area that should be drawn.
-    fn viewbox(&self) -> Rect {
+    pub fn viewbox(&self) -> Rect {
         let root = self.tree.root();
         let rect = match *root.borrow() {
             usvg::NodeKind::Svg(svg) => {
@@ -173,7 +164,7 @@ impl SvgData {
 
     /// Get the size of the svg. This is the size that the svg requests to be drawn. If it is
     /// different from the viewbox size, then scaling will be required.
-    fn size(&self) -> Size {
+    pub fn size(&self) -> Size {
         let root = self.tree.root();
         let rect = match *root.borrow() {
             usvg::NodeKind::Svg(svg) => {
@@ -189,6 +180,20 @@ impl SvgData {
         };
         rect
     }
+
+    /// Calculates the transform that should be applied first to the svg path data, to convert from
+    /// image coordinates to piet coordinates.
+    fn inner_affine(&self) -> Affine {
+        let viewbox = self.viewbox();
+        let size = self.size();
+        // we want to move the viewbox top left to (0,0) and then scale it from viewbox size to
+        // size.
+        // TODO respect preserveAspectRatio
+        let t = Affine::translate((viewbox.min_x(), viewbox.min_y()));
+        let scale =
+            Affine::scale_non_uniform(size.width / viewbox.width(), size.height / viewbox.height());
+        scale * t
+    }
 }
 
 impl Default for SvgData {
@@ -201,10 +206,12 @@ impl FromStr for SvgData {
     type Err = Box<dyn Error>;
 
     fn from_str(svg_str: &str) -> Result<Self, Self::Err> {
-        let re_opt = usvg::Options {
+        let mut re_opt = usvg::Options {
             keep_named_groups: false,
             ..usvg::Options::default()
         };
+
+        re_opt.fontdb.load_system_fonts();
 
         match usvg::Tree::from_str(svg_str, &re_opt) {
             Ok(tree) => Ok(SvgData {
@@ -237,7 +244,10 @@ impl SvgRenderer {
                 for def in n.children() {
                     match &*def.borrow() {
                         usvg::NodeKind::LinearGradient(linear_gradient) => {
-                            self.linear_gradient_def(linear_gradient, ctx);
+                            self.linear_gradient_def(linear_gradient);
+                        }
+                        usvg::NodeKind::RadialGradient(gradient) => {
+                            self.radial_gradient_def(gradient);
                         }
                         other => tracing::error!("unsupported element: {:?}", other),
                     }
@@ -296,7 +306,7 @@ impl SvgRenderer {
 
         match &p.fill {
             Some(fill) => {
-                let brush = self.brush_from_usvg(&fill.paint, fill.opacity, ctx);
+                let brush = self.brush_from_usvg(&fill.paint, fill.opacity);
                 if let usvg::FillRule::EvenOdd = fill.rule {
                     ctx.fill_even_odd(path.clone(), &*brush);
                 } else {
@@ -308,7 +318,7 @@ impl SvgRenderer {
 
         match &p.stroke {
             Some(stroke) => {
-                let brush = self.brush_from_usvg(&stroke.paint, stroke.opacity, ctx);
+                let brush = self.brush_from_usvg(&stroke.paint, stroke.opacity);
                 let mut stroke_style = StrokeStyle::new()
                     .line_join(match stroke.linejoin {
                         usvg::LineJoin::Miter => LineJoin::Miter {
@@ -332,13 +342,10 @@ impl SvgRenderer {
         }
     }
 
-    fn linear_gradient_def(&mut self, lg: &usvg::LinearGradient, ctx: &mut PaintCtx) {
-        // Get start and stop of gradient and transform them to image space (TODO check we need to
-        // apply offset matrix)
-        let start = self.offset_matrix * Point::new(lg.x1, lg.y1);
-        let end = self.offset_matrix * Point::new(lg.x2, lg.y2);
+    fn linear_gradient_def(&mut self, lg: &usvg::LinearGradient) {
+        let start = UnitPoint::new(lg.x1, lg.y1);
+        let end = UnitPoint::new(lg.x2, lg.y2);
         let stops: Vec<_> = lg
-            .base
             .stops
             .iter()
             .map(|stop| GradientStop {
@@ -347,32 +354,54 @@ impl SvgRenderer {
             })
             .collect();
 
-        // TODO error handling
-        let gradient = FixedLinearGradient { start, end, stops };
-        trace!("gradient: {} => {:?}", lg.id, gradient);
-        let gradient = ctx.gradient(gradient).unwrap();
-        self.defs.add_def(lg.id.clone(), gradient);
+        let gradient = LinearGradient::new(start, end, stops);
+        self.defs
+            .add_def(lg.id.clone(), piet::PaintBrush::Linear(gradient));
     }
 
-    fn brush_from_usvg(
-        &self,
-        paint: &usvg::Paint,
-        opacity: usvg::Opacity,
-        ctx: &mut PaintCtx,
-    ) -> Rc<piet::Brush> {
+    fn radial_gradient_def(&mut self, g: &usvg::RadialGradient) {
+        let center = UnitPoint::new(g.fx, g.fy);
+        let origin = UnitPoint::new(g.cx, g.cy);
+
+        let stops: Vec<_> = g
+            .stops
+            .iter()
+            .map(|stop| GradientStop {
+                pos: stop.offset.value() as f32,
+                color: color_from_svg(stop.color, stop.opacity),
+            })
+            .collect();
+
+        let gradient = RadialGradient::new(g.r.value(), stops)
+            .with_center(center)
+            .with_origin(origin);
+        self.defs
+            .add_def(g.id.clone(), piet::PaintBrush::Radial(gradient));
+    }
+
+    fn brush_from_usvg(&self, paint: &usvg::Paint, opacity: usvg::Opacity) -> Rc<piet::PaintBrush> {
         match paint {
             usvg::Paint::Color(c) => {
                 // TODO I'm going to assume here that not retaining colors is OK.
                 let color = color_from_svg(*c, opacity);
-                Rc::new(ctx.solid_brush(color))
+                Rc::new(piet::PaintBrush::Color(color))
             }
-            usvg::Paint::Link(id) => self.defs.find(id).unwrap(),
+            usvg::Paint::Link(id) => match self.defs.find(id) {
+                None => {
+                    // generally this occurs due to unimplemented SVG functionality.
+                    // until the SVG implementation matures log as a trace.
+                    // other logging above will detect and emit the error that
+                    // triggered the issue.
+                    trace!("svg link id requested, but not found: {:?}", id);
+                    Rc::new(piet::PaintBrush::Color(Color::TRANSPARENT))
+                }
+                Some(v) => v,
+            },
         }
     }
 }
 
-// TODO just support linear gradient for now.
-type Def = piet::Brush;
+type Def = piet::PaintBrush;
 
 /// A map from id to <def>
 struct Defs(HashMap<String, Rc<Def>>);
@@ -406,7 +435,7 @@ fn color_from_svg(c: usvg::Color, opacity: usvg::Opacity) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use test_env_log::test;
+    use test_log::test;
 
     #[test]
     fn usvg_transform_vs_affine() {

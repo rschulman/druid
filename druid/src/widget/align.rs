@@ -14,6 +14,7 @@
 
 //! A widget that aligns its child (for example, centering it).
 
+use crate::debug_state::DebugState;
 use crate::widget::prelude::*;
 use crate::{Data, Rect, Size, UnitPoint, WidgetPod};
 use tracing::{instrument, trace};
@@ -128,6 +129,13 @@ impl<T: Data> Widget<T> for Align<T> {
 
         let my_insets = self.child.compute_parent_paint_insets(my_size);
         ctx.set_paint_insets(my_insets);
+        if self.height_factor.is_some() {
+            let baseline_offset = self.child.baseline_offset();
+            if baseline_offset > 0f64 {
+                ctx.set_baseline_offset(baseline_offset + extra_height / 2.0);
+            }
+        }
+
         trace!(
             "Computed layout: origin={}, size={}, insets={:?}",
             origin,
@@ -140,6 +148,14 @@ impl<T: Data> Widget<T> for Align<T> {
     #[instrument(name = "Align", level = "trace", skip(self, ctx, data, env))]
     fn paint(&mut self, ctx: &mut PaintCtx, data: &T, env: &Env) {
         self.child.paint(ctx, data, env);
+    }
+
+    fn debug_state(&self, data: &T) -> DebugState {
+        DebugState {
+            display_name: self.short_type_name().to_string(),
+            children: vec![self.child.widget().debug_state(data)],
+            ..Default::default()
+        }
     }
 }
 

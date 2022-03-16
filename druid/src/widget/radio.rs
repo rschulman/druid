@@ -14,6 +14,7 @@
 
 //! A radio button widget.
 
+use crate::debug_state::DebugState;
 use crate::kurbo::Circle;
 use crate::widget::prelude::*;
 use crate::widget::{CrossAxisAlignment, Flex, Label, LabelText};
@@ -66,19 +67,21 @@ impl<T: Data + PartialEq> Widget<T> for Radio<T> {
     fn event(&mut self, ctx: &mut EventCtx, event: &Event, data: &mut T, _env: &Env) {
         match event {
             Event::MouseDown(_) => {
-                ctx.set_active(true);
-                ctx.request_paint();
-                trace!("Radio button {:?} pressed", ctx.widget_id());
+                if !ctx.is_disabled() {
+                    ctx.set_active(true);
+                    ctx.request_paint();
+                    trace!("Radio button {:?} pressed", ctx.widget_id());
+                }
             }
             Event::MouseUp(_) => {
-                if ctx.is_active() {
-                    ctx.set_active(false);
+                if ctx.is_active() && !ctx.is_disabled() {
                     if ctx.is_hot() {
                         *data = self.variant.clone();
                     }
                     ctx.request_paint();
                     trace!("Radio button {:?} released", ctx.widget_id());
                 }
+                ctx.set_active(false);
             }
             _ => (),
         }
@@ -87,7 +90,7 @@ impl<T: Data + PartialEq> Widget<T> for Radio<T> {
     #[instrument(name = "Radio", level = "trace", skip(self, ctx, event, data, env))]
     fn lifecycle(&mut self, ctx: &mut LifeCycleCtx, event: &LifeCycle, data: &T, env: &Env) {
         self.child_label.lifecycle(ctx, event, data, env);
-        if let LifeCycle::HotChanged(_) = event {
+        if let LifeCycle::HotChanged(_) | LifeCycle::DisabledChanged(_) = event {
             ctx.request_paint();
         }
     }
@@ -104,7 +107,7 @@ impl<T: Data + PartialEq> Widget<T> for Radio<T> {
     fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints, data: &T, env: &Env) -> Size {
         bc.debug_check("Radio");
 
-        let label_size = self.child_label.layout(ctx, &bc, data, env);
+        let label_size = self.child_label.layout(ctx, bc, data, env);
         let radio_diam = env.get(theme::BASIC_WIDGET_HEIGHT);
         let x_padding = env.get(theme::WIDGET_CONTROL_COMPONENT_PADDING);
 
@@ -136,7 +139,7 @@ impl<T: Data + PartialEq> Widget<T> for Radio<T> {
 
         ctx.fill(circle, &background_gradient);
 
-        let border_color = if ctx.is_hot() {
+        let border_color = if ctx.is_hot() && !ctx.is_disabled() {
             env.get(theme::BORDER_LIGHT)
         } else {
             env.get(theme::BORDER_DARK)
@@ -148,10 +151,29 @@ impl<T: Data + PartialEq> Widget<T> for Radio<T> {
         if *data == self.variant {
             let inner_circle = Circle::new((size / 2., size / 2.), INNER_CIRCLE_RADIUS);
 
-            ctx.fill(inner_circle, &env.get(theme::LABEL_COLOR));
+            let fill = if ctx.is_disabled() {
+                env.get(theme::DISABLED_TEXT_COLOR)
+            } else {
+                env.get(theme::CURSOR_COLOR)
+            };
+
+            ctx.fill(inner_circle, &fill);
         }
 
         // Paint the text label
         self.child_label.draw_at(ctx, (size + x_padding, 0.0));
+    }
+
+    fn debug_state(&self, data: &T) -> DebugState {
+        let value_text = if *data == self.variant {
+            format!("[X] {}", self.child_label.text())
+        } else {
+            self.child_label.text().to_string()
+        };
+        DebugState {
+            display_name: self.short_type_name().to_string(),
+            main_value: value_text,
+            ..Default::default()
+        }
     }
 }

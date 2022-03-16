@@ -41,10 +41,10 @@ pub trait ScopeTransfer {
     type State: Data;
 
     /// Replace the input we have within our State with a new one from outside
-    fn read_input(&self, state: &mut Self::State, inner: &Self::In);
+    fn read_input(&self, state: &mut Self::State, input: &Self::In);
     /// Take the modifications we have made and write them back
     /// to our input.
-    fn write_back_input(&self, state: &Self::State, inner: &mut Self::In);
+    fn write_back_input(&self, state: &Self::State, input: &mut Self::In);
 }
 
 /// A default implementation of [`ScopePolicy`] that takes a function and a transfer.
@@ -84,8 +84,8 @@ impl<F: FnOnce(Transfer::In) -> Transfer::State, Transfer: ScopeTransfer> ScopeP
     type State = Transfer::State;
     type Transfer = Transfer;
 
-    fn create(self, inner: &Self::In) -> (Self::State, Self::Transfer) {
-        let state = (self.make_state)(inner.clone());
+    fn create(self, input: &Self::In) -> (Self::State, Self::Transfer) {
+        let state = (self.make_state)(input.clone());
         (state, self.transfer)
     }
 }
@@ -115,7 +115,7 @@ impl<L: Lens<State, In>, In: Data, State: Data> ScopeTransfer for LensScopeTrans
 
     fn read_input(&self, state: &mut State, data: &In) {
         self.lens.with_mut(state, |inner| {
-            if !inner.same(&data) {
+            if !inner.same(data) {
                 *inner = data.clone()
             }
         });
@@ -123,7 +123,7 @@ impl<L: Lens<State, In>, In: Data, State: Data> ScopeTransfer for LensScopeTrans
 
     fn write_back_input(&self, state: &State, data: &mut In) {
         self.lens.with(state, |inner| {
-            if !inner.same(&data) {
+            if !inner.same(data) {
                 *data = inner.clone();
             }
         });
@@ -212,6 +212,34 @@ impl<SP: ScopePolicy, W: Widget<SP::State>> Scope<SP, W> {
                 policy: Some(policy),
             },
             inner: WidgetPod::new(inner),
+        }
+    }
+
+    /// A reference to the contents of the `Scope`'s state.
+    ///
+    /// This allows you to access the content from outside the widget.
+    pub fn state(&self) -> Option<&SP::State> {
+        if let ScopeContent::Transfer { ref state, .. } = &self.content {
+            Some(state)
+        } else {
+            None
+        }
+    }
+
+    /// A mutable reference to the contents of the [`Scope`]'s state.
+    ///
+    /// This allows you to mutably access the content of the `Scope`' s state from
+    /// outside the widget. Mainly useful for composite widgets.
+    ///
+    /// # Note:
+    ///
+    /// If you modify the state through this reference, the Scope will not
+    /// call update on its children until the next event it receives.
+    pub fn state_mut(&mut self) -> Option<&mut SP::State> {
+        if let ScopeContent::Transfer { ref mut state, .. } = &mut self.content {
+            Some(state)
+        } else {
+            None
         }
     }
 
@@ -307,6 +335,9 @@ impl<SP: ScopePolicy, W: Widget<SP::State>> Widget<SP::In> for Scope<SP, W> {
     fn paint(&mut self, ctx: &mut PaintCtx, data: &SP::In, env: &Env) {
         self.with_state(data, |state, inner| inner.paint_raw(ctx, state, env));
     }
+
+    // TODO
+    // fn debug_state(&self, data: &SP::In) -> DebugState;
 }
 
 impl<SP: ScopePolicy, W: Widget<SP::State>> WidgetWrapper for Scope<SP, W> {

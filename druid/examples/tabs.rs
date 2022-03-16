@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// On Windows platform, don't show a console when opening the app.
+#![windows_subsystem = "windows"]
+
 use druid::im::Vector;
 use druid::widget::{
     Axis, Button, CrossAxisAlignment, Flex, Label, MainAxisAlignment, RadioGroup, Split, TabInfo,
@@ -233,7 +236,8 @@ fn build_tab_widget(tab_config: &TabConfig) -> impl Widget<AppState> {
         .with_tab("Page 3", Label::new("Page 3 content"))
         .with_tab("Page 4", Label::new("Page 4 content"))
         .with_tab("Page 5", Label::new("Page 5 content"))
-        .with_tab("Page 6", Label::new("Page 6 content"));
+        .with_tab("Page 6", Label::new("Page 6 content"))
+        .with_tab_index(1);
 
     Split::rows(main_tabs, dyn_tabs).draggable(true)
 }

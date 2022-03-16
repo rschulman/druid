@@ -75,7 +75,7 @@ pub trait EditableText: Sized {
 impl EditableText for String {
     fn cursor<'a>(&self, position: usize) -> Option<StringCursor> {
         let new_cursor = StringCursor {
-            text: &self,
+            text: self,
             position,
         };
 
@@ -91,11 +91,7 @@ impl EditableText for String {
     }
 
     fn slice(&self, range: Range<usize>) -> Option<Cow<str>> {
-        if let Some(slice) = self.get(range) {
-            Some(Cow::from(slice))
-        } else {
-            None
-        }
+        self.get(range).map(Cow::from)
     }
 
     fn len(&self) -> usize {
@@ -373,7 +369,7 @@ pub fn len_utf8_from_first_byte(b: u8) -> usize {
 mod tests {
     use super::*;
     use crate::Data;
-    use test_env_log::test;
+    use test_log::test;
 
     #[test]
     fn replace() {

@@ -88,7 +88,7 @@ use piet::ImageBuf;
 /// #[derive(Clone, Data)]
 /// struct PathEntry {
 ///     // There's no Data impl for PathBuf, but no problem
-///     #[data(same_fn = "PartialEq::eq")]
+///     #[data(eq)]
 ///     path: PathBuf,
 ///     priority: usize,
 ///     // This field is not part of our data model.
@@ -175,6 +175,17 @@ impl_data_simple!(std::net::IpAddr);
 impl_data_simple!(std::net::SocketAddr);
 impl_data_simple!(std::ops::RangeFull);
 impl_data_simple!(druid::piet::InterpolationMode);
+#[cfg(feature = "chrono")]
+impl_data_simple!(chrono::Duration);
+#[cfg(feature = "chrono")]
+impl_data_simple!(chrono::naive::IsoWeek);
+#[cfg(feature = "chrono")]
+impl_data_simple!(chrono::naive::NaiveDate);
+#[cfg(feature = "chrono")]
+impl_data_simple!(chrono::naive::NaiveDateTime);
+#[cfg(feature = "chrono")]
+impl_data_simple!(chrono::naive::NaiveTime);
+
 //TODO: remove me!?
 impl_data_simple!(String);
 
@@ -545,6 +556,20 @@ impl Data for ImageBuf {
     }
 }
 
+#[cfg(feature = "chrono")]
+impl<Tz: chrono::offset::TimeZone + 'static> Data for chrono::Date<Tz> {
+    fn same(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
+#[cfg(feature = "chrono")]
+impl<Tz: chrono::offset::TimeZone + 'static> Data for chrono::DateTime<Tz> {
+    fn same(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
 #[cfg(feature = "im")]
 impl<T: Data> Data for im::Vector<T> {
     fn same(&self, other: &Self) -> bool {
@@ -586,24 +611,16 @@ impl<T: Data> Data for im::OrdSet<T> {
     }
 }
 
-macro_rules! impl_data_for_array {
-    () => {};
-    ($this:tt $($rest:tt)*) => {
-        impl<T: Data> Data for [T; $this] {
-            fn same(&self, other: &Self) -> bool {
-                self.iter().zip(other.iter()).all(|(a, b)| a.same(b))
-            }
-        }
-        impl_data_for_array!($($rest)*);
+impl<T: Data, const N: usize> Data for [T; N] {
+    fn same(&self, other: &Self) -> bool {
+        self.iter().zip(other.iter()).all(|(a, b)| a.same(b))
     }
 }
-
-impl_data_for_array! { 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 }
 
 #[cfg(test)]
 mod test {
     use super::Data;
-    use test_env_log::test;
+    use test_log::test;
 
     #[test]
     fn array_data() {

@@ -34,7 +34,7 @@ use crate::kurbo::Size;
 /// [`layout`]: trait.Widget.html#tymethod.layout
 /// [Flutter BoxConstraints]: https://api.flutter.dev/flutter/rendering/BoxConstraints-class.html
 /// [rounded away from zero]: struct.Size.html#method.expand
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BoxConstraints {
     min: Size,
     max: Size,
@@ -275,7 +275,7 @@ impl BoxConstraints {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use test_env_log::test;
+    use test_log::test;
 
     fn bc(min_width: f64, min_height: f64, max_width: f64, max_height: f64) -> BoxConstraints {
         BoxConstraints::new(

@@ -18,13 +18,10 @@ use crate::widget::prelude::*;
 use crate::{Data, Point, WidgetPod};
 use tracing::instrument;
 
-/// A widget that can switch dynamically between one of many views depending
-/// on application state.
-
 type ChildPicker<T, U> = dyn Fn(&T, &Env) -> U;
 type ChildBuilder<T, U> = dyn Fn(&U, &T, &Env) -> Box<dyn Widget<T>>;
 
-/// A widget that dynamically switches between two children.
+/// A widget that switches dynamically between multiple children.
 pub struct ViewSwitcher<T, U> {
     child_picker: Box<ChildPicker<T, U>>,
     child_builder: Box<ChildBuilder<T, U>>,
@@ -42,6 +39,31 @@ impl<T: Data, U: Data> ViewSwitcher<T, U> {
     ///
     /// The `child_builder` closure creates a new child widget based on
     /// the value passed to it.
+    ///
+    /// # Examples
+    /// ```
+    /// use druid::{
+    ///     widget::{Label, ViewSwitcher},
+    ///     Data, Widget,
+    /// };
+    ///
+    /// #[derive(Clone, PartialEq, Data)]
+    /// enum Foo {
+    ///     A,
+    ///     B,
+    ///     C,
+    /// }
+    ///
+    /// fn ui() -> impl Widget<Foo> {
+    ///     ViewSwitcher::new(
+    ///         |data: &Foo, _env| data.clone(),
+    ///         |selector, _data, _env| match selector {
+    ///             Foo::A => Box::new(Label::new("A")),
+    ///             _ => Box::new(Label::new("Not A")),
+    ///         },
+    ///     )
+    /// }
+    /// ```
     pub fn new(
         child_picker: impl Fn(&T, &Env) -> U + 'static,
         child_builder: impl Fn(&U, &T, &Env) -> Box<dyn Widget<T>> + 'static,

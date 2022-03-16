@@ -19,7 +19,7 @@ use super::{
     Added, Align, BackgroundBrush, Click, Container, Controller, ControllerHost, EnvScope,
     IdentityWrapper, LensWrap, Padding, Parse, SizedBox, WidgetId,
 };
-use crate::widget::Scroll;
+use crate::widget::{DisabledIf, Scroll};
 use crate::{
     Color, Data, Env, EventCtx, Insets, KeyOrValue, Lens, LifeCycleCtx, UnitPoint, Widget,
 };
@@ -75,21 +75,25 @@ pub trait WidgetExt<T: Data>: Widget<T> + Sized + 'static {
     /// Wrap this widget in a [`SizedBox`] with an explicit width.
     ///
     /// [`SizedBox`]: widget/struct.SizedBox.html
-    fn fix_width(self, width: f64) -> SizedBox<T> {
+    fn fix_width(self, width: impl Into<KeyOrValue<f64>>) -> SizedBox<T> {
         SizedBox::new(self).width(width)
     }
 
     /// Wrap this widget in a [`SizedBox`] with an explicit height.
     ///
     /// [`SizedBox`]: widget/struct.SizedBox.html
-    fn fix_height(self, height: f64) -> SizedBox<T> {
+    fn fix_height(self, height: impl Into<KeyOrValue<f64>>) -> SizedBox<T> {
         SizedBox::new(self).height(height)
     }
 
     /// Wrap this widget in an [`SizedBox`] with an explicit width and height
     ///
     /// [`SizedBox`]: widget/struct.SizedBox.html
-    fn fix_size(self, width: f64, height: f64) -> SizedBox<T> {
+    fn fix_size(
+        self,
+        width: impl Into<KeyOrValue<f64>>,
+        height: impl Into<KeyOrValue<f64>>,
+    ) -> SizedBox<T> {
         SizedBox::new(self).width(width).height(height)
     }
 
@@ -232,10 +236,6 @@ pub trait WidgetExt<T: Data>: Widget<T> + Sized + 'static {
     }
 
     /// Wrap this widget in a [`LensWrap`] widget for the provided [`Lens`].
-    ///
-    ///
-    /// [`LensWrap`]: struct.LensWrap.html
-    /// [`Lens`]: trait.Lens.html
     fn lens<S: Data, L: Lens<S, T>>(self, lens: L) -> LensWrap<S, T, L, Self> {
         LensWrap::new(self, lens)
     }
@@ -273,6 +273,18 @@ pub trait WidgetExt<T: Data>: Widget<T> + Sized + 'static {
     fn scroll(self) -> Scroll<T, Self> {
         Scroll::new(self)
     }
+
+    /// Wrap this widget in a [`DisabledIf`] widget.
+    ///
+    /// The provided closure will determine if the widget is disabled.
+    /// See [`is_disabled`] or [`set_disabled`] for more info about disabled state.
+    ///
+    /// [`is_disabled`]: crate::EventCtx::is_disabled
+    /// [`set_disabled`]: crate::EventCtx::set_disabled
+    /// [`DisabledIf`]: crate::widget::DisabledIf
+    fn disabled_if(self, disabled_if: impl Fn(&T, &Env) -> bool + 'static) -> DisabledIf<T, Self> {
+        DisabledIf::new(self, disabled_if)
+    }
 }
 
 impl<T: Data, W: Widget<T> + 'static> WidgetExt<T> for W {}
@@ -283,11 +295,11 @@ impl<T: Data, W: Widget<T> + 'static> WidgetExt<T> for W {}
 
 #[doc(hidden)]
 impl<T: Data> SizedBox<T> {
-    pub fn fix_width(self, width: f64) -> SizedBox<T> {
+    pub fn fix_width(self, width: impl Into<KeyOrValue<f64>>) -> SizedBox<T> {
         self.width(width)
     }
 
-    pub fn fix_height(self, height: f64) -> SizedBox<T> {
+    pub fn fix_height(self, height: impl Into<KeyOrValue<f64>>) -> SizedBox<T> {
         self.height(height)
     }
 }
@@ -316,8 +328,8 @@ impl<T: Data, W> EnvScope<T, W> {
 mod tests {
     use super::*;
     use crate::widget::Slider;
-    use crate::Color;
-    use test_env_log::test;
+    use crate::{Color, Key};
+    use test_log::test;
 
     #[test]
     fn container_reuse() {
@@ -339,13 +351,31 @@ mod tests {
 
     #[test]
     fn sized_box_reuse() {
+        let mut env = Env::empty();
+
         // this should be SizedBox<Align<SizedBox<Slider>>>
         let widget = Slider::new().fix_height(10.0).align_left().fix_width(1.0);
-        assert_eq!(widget.width_and_height(), (Some(1.0), None));
+        assert_eq!(widget.width_and_height(&env), (Some(1.0), None));
 
         // this should be SizedBox<Slider>
         let widget = Slider::new().fix_height(10.0).fix_width(1.0);
-        assert_eq!(widget.width_and_height(), (Some(1.0), Some(10.0)));
+        assert_eq!(widget.width_and_height(&env), (Some(1.0), Some(10.0)));
+
+        const HEIGHT_KEY: Key<f64> = Key::new("test-sized-box-reuse-height");
+        const WIDTH_KEY: Key<f64> = Key::new("test-sized-box-reuse-width");
+        env.set(HEIGHT_KEY, 10.0);
+        env.set(WIDTH_KEY, 1.0);
+
+        // this should be SizedBox<Align<SizedBox<Slider>>>
+        let widget = Slider::new()
+            .fix_height(HEIGHT_KEY)
+            .align_left()
+            .fix_width(WIDTH_KEY);
+        assert_eq!(widget.width_and_height(&env), (Some(1.0), None));
+
+        // this should be SizedBox<Slider>
+        let widget = Slider::new().fix_height(HEIGHT_KEY).fix_width(WIDTH_KEY);
+        assert_eq!(widget.width_and_height(&env), (Some(1.0), Some(10.0)));
     }
 
     /// we only care that this will compile; see
