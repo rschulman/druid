@@ -239,6 +239,16 @@ impl<T, W> ClipBox<T, W> {
         self
     }
 
+    /// Returns a reference to the child `WidgetPod`.
+    pub fn child_pod(&self) -> &WidgetPod<T, W> {
+        &self.child
+    }
+
+    /// Returns a mutable reference to the child `WidgetPod`.
+    pub fn child_pod_mut(&mut self) -> &mut WidgetPod<T, W> {
+        &mut self.child
+    }
+    
     /// Returns a reference to the child widget.
     pub fn child(&self) -> &W {
         self.child.widget()

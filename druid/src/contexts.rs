@@ -34,7 +34,7 @@ use crate::text::{ImeHandlerRef, TextFieldRegistration};
 use crate::{
     commands, sub_window::SubWindowDesc, widget::Widget, Affine, Command, Cursor, Data, Env,
     ExtEventSink, Insets, Menu, Notification, Point, Rect, SingleUse, Size, Target, TimerToken,
-    Vec2, WidgetId, WindowConfig, WindowDesc, WindowHandle, WindowId,
+    Vec2, WidgetId, WidgetPod, WindowConfig, WindowDesc, WindowHandle, WindowId,
 };
 
 /// A macro for implementing methods on multiple contexts.
@@ -722,6 +722,16 @@ impl EventCtx<'_, '_> {
     pub fn request_update(&mut self) {
         trace!("request_update");
         self.widget_state.request_update = true;
+    }
+
+
+    /// Request an update cycle for a child widget.
+    ///
+    /// After this, `update` will be called on the child widget in the next update cycle,
+    /// even if there's not a data change.
+    pub fn request_update_child<T, W>(&mut self, child: &mut WidgetPod<T, W>) {
+        self.widget_state.request_update = true;
+        child.state.request_update = true;
     }
 
     /// Scrolls the area into view.
